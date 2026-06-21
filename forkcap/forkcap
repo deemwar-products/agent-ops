@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# forkcap — a fork-budget guard for Claude Code's nested subagents.
+#
+# Claude Code v2.1.172 (2026-06-10) let subagents spawn their own subagents up
+# to 5 levels deep. Days later: issue #68619 (CRITICAL, open) — subagents
+# recurse 50+ levels, ignore the documented kill-switch CLAUDE_CODE_FORK_SUBAGENT=0,
+# and burn 1.2M tokens in 30 min (one report: a 5-hour budget gone in <5 min).
+# There is no working vendor mitigation.
+#
+# forkcap is a PreToolUse hook on the Task/Agent tool. It keeps a per-session
+# ledger of spawn attempts and DENIES once the session crosses a fork budget —
+# a hard ceiling the runaway can't get around. Because PreToolUse hooks now fire
+# inside subagents too (the payload carries agent_id/agent_type), one ledger
+# bounds the WHOLE spawn tree, not just the top-level agent.
+#
+# Usage:
+#   forkcap                 # hook mode — reads PreToolUse JSON on stdin
+#   forkcap status [sid]    # show spawn count for a session (or all)
+#   forkcap reset [sid]     # clear a session's ledger (or all)
+#   forkcap install         # print the settings.json hook snippet
+#   forkcap --help
+#
+# Config (env):
+#   FORKCAP_MAX        max Task/Agent spawns per session   (default 25)
+#   FORKCAP_STATE_DIR  ledger directory                    (default ~/.cache/forkcap)
+#   FORKCAP_DISABLE    any non-empty value = always allow (off switch)
+set -u
+
+FORKCAP_MAX="${FORKCAP_MAX:-25}"
+FORKCAP_STATE_DIR="${FORKCAP_STATE_DIR:-$HOME/.cache/forkcap}"
+
+# --- allow helper: a PreToolUse "no decision" is just exit 0 (normal flow) ----
+allow() { exit 0; }
+
+# --- deny helper: structured PreToolUse deny (exit 0 + JSON on stdout) --------
+deny() {
+  local reason="$1"
+  if command -v jq >/dev/null 2>&1; then
+    jq -n --arg r "$reason" '{
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: $r
+      }
+    }'
+  else
+    printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"%s"}}\n' "$reason"
+  fi
+  exit 0
+}
+
+sanitize() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+
+cmd_install() {
+  cat <<'JSON'
+Add this to .claude/settings.json (project) or ~/.claude/settings.json (global):
+
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Task|Agent",
+        "hooks": [
+          { "type": "command", "command": "forkcap" }
+        ]
+      }
+    ]
+  }
+}
+
+Then set a budget if 25 is wrong for you:  export FORKCAP_MAX=40
+JSON
+}
+
+cmd_status() {
+  local sid="${1:-}"
+  if [ -n "$sid" ]; then
+    local f="$FORKCAP_STATE_DIR/$(sanitize "$sid").ledger"
+    local n=0; [ -f "$f" ] && n=$(wc -l < "$f" | tr -d ' ')
+    printf 'forkcap: session %s — %s/%s spawn attempts\n' "$sid" "$n" "$FORKCAP_MAX"
+    return
+  fi
+  if [ ! -d "$FORKCAP_STATE_DIR" ] || [ -z "$(ls -A "$FORKCAP_STATE_DIR" 2>/dev/null)" ]; then
+    printf 'forkcap: no sessions tracked (budget %s)\n' "$FORKCAP_MAX"
+    return
+  fi
+  printf 'forkcap — fork budget %s/session\n' "$FORKCAP_MAX"
+  local f n base
+  for f in "$FORKCAP_STATE_DIR"/*.ledger; do
+    [ -f "$f" ] || continue
+    n=$(wc -l < "$f" | tr -d ' '); base=$(basename "$f" .ledger)
+    local flag=""; [ "$n" -gt "$FORKCAP_MAX" ] && flag="  ⚠ OVER BUDGET"
+    printf '  %-40s %s/%s%s\n' "$base" "$n" "$FORKCAP_MAX" "$flag"
+  done
+}
+
+cmd_reset() {
+  local sid="${1:-}"
+  if [ -n "$sid" ]; then
+    rm -f "$FORKCAP_STATE_DIR/$(sanitize "$sid").ledger"
+    printf 'forkcap: reset session %s\n' "$sid"
+  else
+    rm -f "$FORKCAP_STATE_DIR"/*.ledger 2>/dev/null
+    printf 'forkcap: reset all sessions\n'
+  fi
+}
+
+cmd_help() {
+  sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# --- subcommand dispatch -----------------------------------------------------
+case "${1:-}" in
+  status)  cmd_status "${2:-}"; exit 0 ;;
+  reset)   cmd_reset  "${2:-}"; exit 0 ;;
+  install) cmd_install; exit 0 ;;
+  -h|--help|help) cmd_help; exit 0 ;;
+esac
+
+# --- hook mode (default): read PreToolUse JSON on stdin ----------------------
+# Off switch wins immediately.
+[ -n "${FORKCAP_DISABLE:-}" ] && allow
+
+input=""
+# Only read stdin if it isn't an interactive terminal (avoid hanging on `forkcap`).
+if [ ! -t 0 ]; then input="$(cat)"; fi
+# Fail OPEN: a guard that breaks the session on bad input is worse than no guard.
+[ -z "$input" ] && allow
+
+if command -v jq >/dev/null 2>&1; then
+  tool_name=$(printf '%s' "$input" | jq -r '.tool_name // empty' 2>/dev/null) || allow
+  session_id=$(printf '%s' "$input" | jq -r '.session_id // "nosession"' 2>/dev/null)
+  agent_id=$(printf '%s' "$input" | jq -r '.agent_id // "main"' 2>/dev/null)
+  agent_type=$(printf '%s' "$input" | jq -r '.agent_type // "-"' 2>/dev/null)
+else
+  # jq absent — crude but fail-open extraction.
+  tool_name=$(printf '%s' "$input" | grep -o '"tool_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+  session_id=$(printf '%s' "$input" | grep -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+  [ -z "$session_id" ] && session_id="nosession"
+  agent_id="main"; agent_type="-"
+fi
+
+# Only count spawn tools. Anything else: allow, don't touch the ledger.
+case "$tool_name" in
+  Task|Agent) ;;
+  *) allow ;;
+esac
+
+mkdir -p "$FORKCAP_STATE_DIR" 2>/dev/null || allow
+ledger="$FORKCAP_STATE_DIR/$(sanitize "$session_id").ledger"
+
+# Append-then-count: the append is atomic (O_APPEND), so concurrent subagents
+# can't lose each other's writes. Once the ledger crosses MAX it stays over —
+# the budget latches shut, which is exactly what stops a runaway.
+printf '%s\t%s\t%s\n' "$agent_id" "$agent_type" "$tool_name" >> "$ledger" 2>/dev/null || allow
+count=$(wc -l < "$ledger" 2>/dev/null | tr -d ' ')
+[ -z "$count" ] && allow
+
+if [ "$count" -gt "$FORKCAP_MAX" ]; then
+  deny "forkcap: session fork budget exceeded ($count > $FORKCAP_MAX Task/Agent spawns). Runaway-spawn guard for nested subagents (anthropics/claude-code#68619 — the CLAUDE_CODE_FORK_SUBAGENT kill-switch is ignored). Raise FORKCAP_MAX or run 'forkcap reset $session_id' once you've confirmed it's not a runaway."
+fi
+
+allow

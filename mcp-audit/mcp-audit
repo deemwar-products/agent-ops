@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""mcp-audit — audit your .mcp.json before an MCP server audits you.
+
+Every MCP server you wire up is code you run and a set of tool descriptions that
+go straight into the model's context — the single largest trust + injection +
+egress surface in an agent setup, and the one config nobody lints. mcp-audit
+reads .mcp.json and flags the server shapes that actually bite:
+
+  • remote (url) servers      — your context goes to someone else's endpoint
+  • unpinned npx packages     — you run whatever 'latest' is, every session
+  • inline secrets in env     — a token committed in the config file
+  • broad filesystem scope    — a server pointed at $HOME or /
+
+Usage:
+  mcp-audit [.mcp.json ...]    # default: ./.mcp.json (and ~/.claude.json if present)
+Exit 0 = clean, 1 = at least one finding.
+"""
+import json
+import os
+import re
+import sys
+
+RED = "\033[31m"; YEL = "\033[33m"; GRN = "\033[32m"; CYN = "\033[36m"; DIM = "\033[2m"; RST = "\033[0m"
+if not sys.stdout.isatty():
+    RED = YEL = GRN = CYN = DIM = RST = ""
+SEV = {"HIGH": RED, "WARN": YEL, "INFO": CYN}
+
+# a value that looks like a real secret rather than a ${VAR} reference / placeholder
+SECRET_KEY = re.compile(r"(token|secret|key|password|passwd|apikey|api_key|pat)", re.I)
+SECRET_VAL = re.compile(r"^(?!\$\{)(?!<)(?!your[-_])[A-Za-z0-9_\-]{16,}$")
+BROAD_PATHS = ("/", os.path.expanduser("~"), "~", "$HOME", "/Users", "/home")
+
+
+def servers(doc):
+    # support both {"mcpServers": {...}} and {"servers": {...}}
+    for k in ("mcpServers", "servers"):
+        if isinstance(doc.get(k), dict):
+            return doc[k]
+    return {}
+
+
+def audit(path):
+    findings = []
+    add = lambda s, t, f: findings.append((s, t, f))
+    try:
+        doc = json.loads(open(path, encoding="utf-8", errors="replace").read())
+    except json.JSONDecodeError as e:
+        add("HIGH", f"invalid JSON ({e.msg} at line {e.lineno})", "the agent can't load a malformed .mcp.json.")
+        return findings, 0
+    srv = servers(doc)
+    if not srv:
+        return findings, 0
+
+    for name, cfg in srv.items():
+        if not isinstance(cfg, dict):
+            continue
+        # remote / URL server — context egress + you trust their tool descriptions
+        if cfg.get("url") or cfg.get("type") in ("sse", "http", "streamable-http"):
+            u = cfg.get("url", "")
+            add("WARN", f"'{name}' is a remote server ({u or 'url/sse'})",
+                "your prompts + context go to that endpoint, and its tool descriptions enter the model's context. Trust it like a dependency.")
+        cmd = cfg.get("command", "")
+        args = cfg.get("args", []) if isinstance(cfg.get("args"), list) else []
+        argstr = " ".join(str(a) for a in args)
+        # unpinned npx package — supply-chain: you run whatever latest is.
+        # the package is the FIRST non-flag arg; everything after is server args (paths/flags).
+        if cmd in ("npx", "bunx", "pnpm") or "npx" in cmd:
+            pkg = next((a for a in args if isinstance(a, str) and not a.startswith("-")), None)
+            if pkg and not pkg.startswith((".", "/", "~")) and "@" not in pkg.rsplit("/", 1)[-1]:
+                add("WARN", f"'{name}' runs an unpinned package ({pkg})",
+                    "no version pin = you execute whatever the registry serves, every session. Pin it (pkg@x.y.z).")
+        # uvx / pip unpinned (python servers)
+        if cmd in ("uvx", "uv") and not re.search(r"==|@", argstr):
+            add("INFO", f"'{name}' runs an unpinned python tool",
+                "pin the version so a server update can't change behavior silently.")
+        # broad filesystem scope
+        for a in args:
+            if isinstance(a, str) and (a in BROAD_PATHS or a.rstrip("/") in [b.rstrip("/") for b in BROAD_PATHS]):
+                add("WARN", f"'{name}' is scoped to a broad path ({a})",
+                    "the server can read everything under it. Point it at the specific project dir.")
+        # inline secret in env
+        env = cfg.get("env", {})
+        if isinstance(env, dict):
+            for k, v in env.items():
+                if isinstance(v, str) and SECRET_KEY.search(k) and SECRET_VAL.match(v):
+                    add("HIGH", f"'{name}' has an inline secret in env ({k})",
+                        "a token committed in .mcp.json leaks to anyone with the repo. Use ${ENV_VAR} and keep the value out of git.")
+
+    n = len(srv)
+    add("INFO", f"{n} MCP server(s) configured",
+        "each server's tool descriptions load into the model's context — an instruction surface you didn't write. Keep the list short and trusted.")
+    return findings, n
+
+
+def discover(args):
+    if args:
+        return args
+    out = [f for f in (".mcp.json",) if os.path.isfile(f)]
+    return out
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    files = discover(args)
+    if not files:
+        print("mcp-audit: no .mcp.json here — no MCP servers to audit.")
+        sys.exit(0)
+    bad = 0
+    for path in files:
+        if not os.path.isfile(path):
+            sys.stderr.write(f"mcp-audit: no such file: {path}\n"); bad = 1; continue
+        findings, n = audit(path)
+        print(f"mcp-audit — {path}  {DIM}({n} server(s)){RST}\n")
+        blocking = [f for f in findings if f[0] in ("HIGH", "WARN")]
+        if not blocking:
+            # only the INFO server-count line (or nothing)
+            for sev, title, fix in findings:
+                print(f"  {SEV[sev]}● {sev:<4}{RST} {title}\n          {DIM}{fix}{RST}")
+            print(f"\n  {GRN}✓ no risky server shapes found.{RST}\n")
+            continue
+        bad = 1
+        order = {"HIGH": 0, "WARN": 1, "INFO": 2}
+        for sev, title, fix in sorted(findings, key=lambda f: order[f[0]]):
+            print(f"  {SEV[sev]}● {sev:<4}{RST} {title}")
+            print(f"          {DIM}{fix}{RST}")
+        print()
+    sys.exit(1 if bad else 0)
+
+
+if __name__ == "__main__":
+    main()

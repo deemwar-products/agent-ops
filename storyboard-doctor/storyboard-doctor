@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""storyboard-doctor — pre-flight an auto-demo storyboard JSON and catch the
+timing/escaping mistakes that otherwise cost you a full render to discover.
+
+Built from real pain: across one session of house demos, the same handful of
+issues forced ~10 re-renders — a card's voiceover running longer than the card,
+captions timed past the end of a dead-air-trimmed terminal segment, a voiceover
+anchored to a timeline entry that doesn't exist, and a VHS `Type` line with
+inline JSON that broke the tape parser. All of those are detectable from the
+storyboard alone, before `produce.ts` ever runs.
+
+  storyboard-doctor <storyboard.json> [--rate W] [--cli-ceiling S]
+
+Exit 0 = clean, 1 = problems found. Speech estimate defaults to 2.6 words/sec
+(Charon-ish); CLI segment length is ESTIMATED from the number of commands the tape runs
+(produce trims inter-command dead air, so Sleep values don't lengthen it);
+override with --cli-ceiling.
+"""
+import json
+import re
+import sys
+
+RATE = 2.6          # words/sec (rough speech rate for the default voice)
+OUTRO_DEFAULT = 5   # synthesized card:outro duration when the theme supplies it
+
+# produce.ts trims inter-command dead air, so a terminal segment's held length is
+# driven by how many commands it runs, NOT by the Sleep values. Calibrated against
+# real renders this works out to roughly base + per-command seconds; we use a
+# conservative (low) estimate so the linter warns *before* a render overruns.
+SEG_BASE = 2.0
+SEG_PER_COMMAND = 2.5
+SEG_FLOOR = 5.5
+
+
+def est_secs(text, rate):
+    return len(text.split()) / rate if text else 0.0
+
+
+def visible_commands(seg):
+    """Count the commands a vhs tape actually runs after `Show` (excludes the
+    hidden setup, comment `# ` lines, and `clear`) — the driver of segment length."""
+    n, shown = 0, False
+    for line in seg.get("lines", []):
+        s = line.strip()
+        if s == "Show":
+            shown = True; continue
+        if not shown or not s.startswith("Type "):
+            continue
+        body = s[5:].strip().strip('"').strip()
+        if not body or body.startswith("#") or body == "clear":
+            continue
+        n += 1
+    return n
+
+
+def est_segment_secs(seg):
+    """Estimated seconds a dead-air-trimmed terminal segment will hold."""
+    return max(SEG_FLOOR, SEG_BASE + SEG_PER_COMMAND * visible_commands(seg))
+
+
+def lint(sb, rate, forced_ceiling=None):
+    problems = []  # (level, msg)
+    err = lambda m: problems.append(("ERROR", m))
+    warn = lambda m: problems.append(("WARN", m))
+
+    cards = {c.get("id"): c for c in sb.get("cards", [])}
+    vhs = {v.get("id") for v in sb.get("vhs", [])}
+    # per-segment estimated hold time (or a forced ceiling if the user passed one)
+    seg_secs = {v.get("id"): (forced_ceiling if forced_ceiling is not None else est_segment_secs(v))
+                for v in sb.get("vhs", [])}
+    def ceil_for(sid):
+        return seg_secs.get(sid, forced_ceiling if forced_ceiling is not None else 10.5)
+    web = {w.get("id") for w in sb.get("web", [])}
+    clip = {c.get("id") for c in sb.get("clip", [])}
+    timeline = sb.get("timeline", [])
+
+    def seg_kind_id(entry):
+        kind, _, sid = entry.partition(":")
+        return kind, sid
+
+    # 1. timeline entries resolve to a real card / segment (outro may be synthesized)
+    for entry in timeline:
+        kind, sid = seg_kind_id(entry)
+        if kind == "card":
+            if sid not in cards and sid != "outro":
+                err(f"timeline references card:{sid} but no such card is defined")
+        elif kind == "vhs":
+            if sid not in vhs:
+                err(f"timeline references vhs:{sid} but no such vhs segment")
+        elif kind == "web":
+            if sid not in web:
+                err(f"timeline references web:{sid} but no such web segment")
+        elif kind == "clip":
+            if sid not in clip:
+                err(f"timeline references clip:{sid} but no such clip")
+        elif kind == "recording":
+            pass
+        else:
+            warn(f"timeline entry '{entry}' has an unrecognized kind '{kind}'")
+
+    # 2. voiceover parts: anchor must be on the timeline; estimate fit
+    vo = sb.get("voiceover", {})
+    for i, part in enumerate(vo.get("parts", [])):
+        at = part.get("at", "")
+        text = part.get("text", "")
+        if at not in timeline:
+            err(f"voiceover part {i} anchored to '{at}', which is not in the timeline "
+                f"(produce.ts will fail on this)")
+            continue
+        secs = est_secs(text, rate)
+        kind, sid = seg_kind_id(at)
+        if kind == "card":
+            dur = cards.get(sid, {}).get("duration", OUTRO_DEFAULT)
+            if secs > dur + 0.05:
+                warn(f"card:{sid} VO ≈{secs:.1f}s > card duration {dur}s — bump the card's "
+                     f"duration to ≥{secs:.0f}, or trim ~{len((part.get('text') or '').split()) - int(dur*rate)} words")
+        elif kind == "vhs":
+            ceiling = ceil_for(sid)
+            if secs > ceiling:
+                warn(f"vhs:{sid} VO ≈{secs:.1f}s likely > ~{ceiling:.1f}s a trimmed terminal "
+                     f"segment holds — trim to ≤{int(ceiling*rate)} words, or add a visible command "
+                     f"to lengthen the segment")
+
+    # 3. captions: segment exists; vhs caption windows shouldn't run past the ceiling
+    for i, cap in enumerate(sb.get("captions", [])):
+        seg = cap.get("segment", "")
+        kind, sid = seg_kind_id(seg)
+        exists = (kind == "vhs" and sid in vhs) or (kind == "web" and sid in web) or \
+                 (kind == "clip" and sid in clip)
+        if not exists:
+            err(f"caption {i} targets segment '{seg}' which is not defined")
+            continue
+        if kind == "vhs":
+            ceiling = ceil_for(sid)
+            if cap.get("to", 0) > ceiling:
+                warn(f"caption {i} on vhs:{sid} ends at {cap['to']}s, past ~{ceiling:.1f}s the segment "
+                     f"likely holds — it may not render. Pull 'to' back to ≤{ceiling:.1f}.")
+
+    # 4. risky VHS Type lines (inline quotes + pipe/braces) that break the tape parser
+    for v in sb.get("vhs", []):
+        for line in v.get("lines", []):
+            if not line.startswith("Type "):
+                continue
+            body = line[5:]
+            if ("|" in body or "{" in body) and ('\\"' in body or body.count('"') > 2):
+                warn(f"vhs:{v.get('id')} Type line with inline quotes + pipe/braces may break the "
+                     f"VHS tape parser — feed the data from a file instead "
+                     f"(e.g. `tool < input.json`). Line: {body[:60]}…")
+
+    return problems
+
+
+def main():
+    args = sys.argv[1:]
+    rate, forced_ceiling, path = RATE, None, None   # ceiling None => adaptive per-segment estimate
+    i = 0
+    while i < len(args):
+        if args[i] == "--rate":
+            rate = float(args[i + 1]); i += 2
+        elif args[i] == "--cli-ceiling":
+            forced_ceiling = float(args[i + 1]); i += 2
+        else:
+            path = args[i]; i += 1
+    if not path:
+        sys.stderr.write(__doc__); sys.exit(2)
+    try:
+        sb = json.load(open(path))
+    except (OSError, json.JSONDecodeError) as e:
+        sys.stderr.write(f"storyboard-doctor: cannot read {path}: {e}\n"); sys.exit(2)
+
+    problems = lint(sb, rate, forced_ceiling)
+    name = sb.get("name", path)
+    if not problems:
+        print(f"✓ {name}: clean — no timing or escaping problems found.")
+        sys.exit(0)
+    errs = sum(1 for lvl, _ in problems if lvl == "ERROR")
+    warns = len(problems) - errs
+    print(f"{name}: {errs} error(s), {warns} warning(s)\n")
+    for lvl, msg in problems:
+        mark = "✗" if lvl == "ERROR" else "⚠"
+        print(f"  {mark} {lvl}: {msg}")
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

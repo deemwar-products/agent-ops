@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# mergerase — find public capabilities that silently disappeared across a merge.
+#
+# When several agents work the same repo in parallel, each branches from a frozen
+# snapshot with no awareness of its siblings. At merge, the conflict-resolving
+# step "picks a winner" with no understanding of intent — and a feature one agent
+# built simply stops existing. No error, no failing test, green CI. The export
+# button stops filtering by date; a refactor gets half-reverted. (getautonoma.com,
+# Apr 2026.)
+#
+# mergerase compares the PUBLIC SYMBOL surface of two git states and reports the
+# exported names that were present BEFORE and are gone AFTER. On a merge that's
+# the silent-erasure signature: a capability that lived in a parent branch but
+# isn't in the merged result.
+#
+# Usage:
+#   mergerase                      # HEAD must be a merge; compare each parent -> HEAD
+#   mergerase <before> [<after>]   # compare two refs (after defaults to the worktree)
+#   mergerase --help
+#
+# Exits non-zero if any public symbol disappeared (drops into a CI gate).
+# Needs only git + bash (3.2+). Languages: JS/TS, Python, Go.
+set -u
+
+PS_JS=(-- '*.js' '*.jsx' '*.ts' '*.tsx' '*.mjs' '*.cjs')
+PS_PY=(-- '*.py')
+PS_GO=(-- '*.go')
+
+die() { echo "mergerase: $*" >&2; exit 2; }
+command -v git >/dev/null 2>&1 || die "git not found"
+git rev-parse --git-dir >/dev/null 2>&1 || die "not a git repository"
+
+# Run git grep at <ref> ("" = worktree) and normalize each line to "file:line:text".
+# Pathspec is passed via the global GREP_PS array (kept bash-3.2 safe — no namerefs).
+_grep() { # <ref> <ere...>   (GREP_PS set by caller)
+  local ref="$1"; shift
+  local refargs=(); [ -n "$ref" ] && refargs=("$ref")
+  local eargs=(); local e; for e in "$@"; do eargs+=(-e "$e"); done
+  git grep -I -n -E "${eargs[@]}" "${refargs[@]}" "${GREP_PS[@]}" 2>/dev/null \
+    | { if [ -n "$ref" ]; then sed "s|^$ref:||"; else cat; fi; }
+}
+
+# Split a normalized "file:line:text" into globals FILE and TEXT.
+_split() {
+  local line="$1"
+  FILE="${line%%:*}"
+  local rest="${line#*:}"   # line:text
+  TEXT="${rest#*:}"         # text
+}
+
+# symbols_at <ref> -> "name<TAB>file" per public symbol.
+symbols_at() {
+  local ref="$1" line
+  # --- JS / TS ---
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue; _split "$line"
+    if   [[ $TEXT =~ export[[:space:]]+(default[[:space:]]+)?(async[[:space:]]+)?function[[:space:]]+([A-Za-z_\$][A-Za-z0-9_\$]*) ]]; then printf '%s\t%s\n' "${BASH_REMATCH[3]}" "$FILE"
+    elif [[ $TEXT =~ export[[:space:]]+(const|let|var|class)[[:space:]]+([A-Za-z_\$][A-Za-z0-9_\$]*) ]]; then printf '%s\t%s\n' "${BASH_REMATCH[2]}" "$FILE"
+    elif [[ $TEXT =~ exports\.([A-Za-z_\$][A-Za-z0-9_\$]*) ]]; then printf '%s\t%s\n' "${BASH_REMATCH[1]}" "$FILE"
+    elif [[ $TEXT =~ export[[:space:]]*\{([^}]*)\} ]]; then
+      local body="${BASH_REMATCH[1]}" tok nm IFS=','
+      for tok in $body; do
+        tok="${tok//[[:space:]]/}"; [ -z "$tok" ] && continue
+        if [[ $tok =~ as([A-Za-z_\$][A-Za-z0-9_\$]*)$ ]]; then nm="${BASH_REMATCH[1]}"; else nm="$tok"; fi
+        printf '%s\t%s\n' "$nm" "$FILE"
+      done
+    fi
+  done < <(GREP_PS=("${PS_JS[@]}"); _grep "$ref" \
+      'export[[:space:]]+(default[[:space:]]+)?(async[[:space:]]+)?function[[:space:]]+[A-Za-z_$]' \
+      'export[[:space:]]+(const|let|var|class)[[:space:]]+[A-Za-z_$]' \
+      '(module\.)?exports\.[A-Za-z_$]' \
+      'export[[:space:]]*\{[^}]*\}')
+  # --- Python (top-level public def/class) ---
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue; _split "$line"
+    if   [[ $TEXT =~ ^(async[[:space:]]+)?def[[:space:]]+([A-Za-z][A-Za-z0-9_]*) ]]; then printf '%s\t%s\n' "${BASH_REMATCH[2]}" "$FILE"
+    elif [[ $TEXT =~ ^class[[:space:]]+([A-Za-z][A-Za-z0-9_]*) ]]; then printf '%s\t%s\n' "${BASH_REMATCH[1]}" "$FILE"
+    fi
+  done < <(GREP_PS=("${PS_PY[@]}"); _grep "$ref" '^(async[[:space:]]+)?def[[:space:]]+[A-Za-z]' '^class[[:space:]]+[A-Za-z]')
+  # --- Go (exported = Capitalized) ---
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue; _split "$line"
+    if   [[ $TEXT =~ ^func[[:space:]]+(\([^\)]*\)[[:space:]]*)?([A-Z][A-Za-z0-9_]*) ]]; then printf '%s\t%s\n' "${BASH_REMATCH[2]}" "$FILE"
+    elif [[ $TEXT =~ ^type[[:space:]]+([A-Z][A-Za-z0-9_]*) ]]; then printf '%s\t%s\n' "${BASH_REMATCH[1]}" "$FILE"
+    fi
+  done < <(GREP_PS=("${PS_GO[@]}"); _grep "$ref" '^func[[:space:]]+(\([^)]*\)[[:space:]]*)?[A-Z]' '^type[[:space:]]+[A-Z]')
+}
+
+# report_lost <before-ref> <after-ref> <label> : names in before but not after.
+report_lost() {
+  local before="$1" after="$2" label="$3"
+  local bf af lost
+  bf=$(symbols_at "$before")
+  af=$(symbols_at "$after" | cut -f1 | sort -u)
+  lost=$(comm -23 <(printf '%s\n' "$bf" | cut -f1 | awk 'NF' | sort -u) \
+                  <(printf '%s\n' "$af" | awk 'NF'))
+  if [ -z "$lost" ]; then
+    echo "  ✓ $label — no public symbols disappeared"
+    return 0
+  fi
+  echo "  ✗ $label — public symbol(s) gone:"
+  local name where
+  while IFS= read -r name; do
+    [ -z "$name" ] && continue
+    where=$(printf '%s\n' "$bf" | awk -F'\t' -v k="$name" '$1==k{print $2; exit}')
+    printf '      LOST  %-30s (was in %s)\n' "$name" "$where"
+  done <<< "$lost"
+  echo "      -> $(printf '%s\n' "$lost" | awk 'NF' | wc -l | tr -d ' ') symbol(s) — confirm intentional, not silent merge erasure."
+  return 1
+}
+
+case "${1:-}" in
+  -h|--help|help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+
+rc=0
+if [ $# -eq 0 ]; then
+  read -r _ p1 p2 p3 <<< "$(git rev-list --parents -n1 HEAD 2>/dev/null)"
+  [ -n "${p2:-}" ] || die "HEAD is not a merge commit. Pass refs: mergerase <before> [<after>]"
+  echo "mergerase — HEAD is a merge; checking each parent for lost public symbols"
+  i=1
+  for par in "$p1" "$p2" ${p3:-}; do
+    [ -n "$par" ] || continue
+    report_lost "$par" "HEAD" "parent $i ($(git rev-parse --short "$par")) -> merge" || rc=1
+    i=$((i+1))
+  done
+else
+  before="$1"; after="${2:-}"
+  git rev-parse --verify "$before" >/dev/null 2>&1 || die "no such ref: $before"
+  [ -n "$after" ] && { git rev-parse --verify "$after" >/dev/null 2>&1 || die "no such ref: $after"; }
+  echo "mergerase — comparing ${before} -> ${after:-<worktree>}"
+  report_lost "$before" "$after" "${before} -> ${after:-worktree}" || rc=1
+fi
+exit $rc

@@ -28,6 +28,7 @@ bash    agent-ops/preflight/preflight
 | [`auto-snapshot`](auto-snapshot/) | make an agent's uncommitted work impossible to lose — auto-snapshot the working tree | [read →](https://deemwar.com/insights/the-agent-work-you-cant-recover) |
 | [`preflight`](preflight/) | ask git before your agents collide — a worktree/branch collision pre-check | [read →](https://deemwar.com/insights/preflight-check-before-agents-collide) |
 | [`worktree-doctor`](worktree-doctor/) | flag agent worktrees that would silently lose work on cleanup | [read →](https://deemwar.com/insights/your-agent-fleets-worktrees-are-a-minefield) |
+| [`mergerase`](mergerase/) | find public capabilities that silently disappeared across a parallel-agent merge | [read →](mergerase/blog-post.md) |
 
 ### See your fleet (observe)
 
@@ -43,6 +44,7 @@ bash    agent-ops/preflight/preflight
 |------|--------------|-----------|
 | [`agent-guard`](agent-guard/) | a PreToolUse hook that blocks destructive agent commands (git reset --hard, rm -rf, push --force) | [read →](https://deemwar.com/insights/stop-your-agent-running-git-reset-hard) |
 | [`agent-frisk`](agent-frisk/) | find the invisible Unicode instructions that hijack a coding agent | [read →](https://deemwar.com/insights/your-agent-reads-text-you-cant-see) |
+| [`forkcap`](forkcap/) | a fork-budget guard that caps Claude Code's runaway nested subagents | [read →](forkcap/blog-post.md) |
 
 ### Secure & audit config
 
@@ -51,6 +53,7 @@ bash    agent-ops/preflight/preflight
 | [`agent-reach`](agent-reach/) | measure a coding agent's secret blast radius — which secret stores are in reach | [read →](https://deemwar.com/insights/your-agent-can-read-everything-your-shell-can) |
 | [`perm-audit`](perm-audit/) | flag over-permissive Claude Code settings.json permissions | [read →](https://deemwar.com/insights/the-loosest-line-in-your-claude-settings) |
 | [`trifecta-scan`](trifecta-scan/) | cross-config lethal-trifecta scanner — catch read+untrusted+exfil reachable in one grant set | [read →](https://deemwar.com/insights/no-single-line-is-wrong-the-combination-is) |
+| [`mcp-audit`](mcp-audit/) | lint your `.mcp.json` — the highest-trust, never-linted agent config — for egress/security surface | [read →](mcp-audit/blog-post.md) |
 
 ### Context & cost
 
@@ -79,6 +82,12 @@ bash    agent-ops/preflight/preflight
 | [`mcpfunnel`](mcpfunnel/) | measure how much of the official MCP registry actually runs | [read →](https://deemwar.com/insights/in-the-registry-is-not-runs) |
 | [`agentpr`](agentpr/) | do AI PRs dodge review? run the measurement on your own repo | [read →](https://deemwar.com/insights/the-ai-skips-code-review-panic) |
 
+### Author agent demos
+
+| Tool | What it does | The story |
+|------|--------------|-----------|
+| [`storyboard-doctor`](storyboard-doctor/) | pre-render linter for auto-demo storyboard JSON — catch dead-air/duration mismatches before you render | [read →](storyboard-doctor/README.md) |
+
 ---
 
-25 tools. Everything here is heuristic and honestly labelled — estimates, not bills; where a finding is uncertain or our own hypothesis lost, the write-up says so. Built and run by [deemwar](https://deemwar.com). Putting agents to work on code that matters? **[Talk to us](https://deemwar.com/contact).**
+29 tools. Everything here is heuristic and honestly labelled — estimates, not bills; where a finding is uncertain or our own hypothesis lost, the write-up says so. Built and run by [deemwar](https://deemwar.com). Putting agents to work on code that matters? **[Talk to us](https://deemwar.com/contact).**
