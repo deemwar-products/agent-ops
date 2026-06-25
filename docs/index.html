@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agent-ops — the operational layer for AI coding agents</title>
+<meta name="description" content="33 small, dependency-light tools for running AI coding agents in production: recover, prevent, observe, spend, secure, set up, verify. One script each, no install. Built and run by deemwar.">
+<link rel="canonical" href="https://github.com/deemwar-products/agent-ops">
+<meta property="og:type" content="website">
+<meta property="og:title" content="agent-ops — the operational layer for AI coding agents">
+<meta property="og:description" content="33 small, dependency-light tools for running AI coding agents in production. One script each, no install. Built and run by deemwar.">
+<meta property="og:url" content="https://github.com/deemwar-products/agent-ops">
+<meta name="twitter:card" content="summary_large_image">
+<style>
+  :root{
+    --bg:#0c0e12; --panel:#13161c; --panel-2:#171b22; --line:#242a33;
+    --ink:#e8ebf0; --muted:#9aa3b2; --dim:#6b7484;
+    --accent:#5eead4; --accent-2:#38bdf8; --hot:#fbbf24;
+    --radius:14px; --maxw:1120px;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font:16px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  a{color:var(--accent-2); text-decoration:none}
+  a:hover{text-decoration:underline}
+  code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  .wrap{max-width:var(--maxw); margin:0 auto; padding:0 22px}
+
+  /* nav */
+  nav{position:sticky; top:0; z-index:10; backdrop-filter:blur(8px);
+      background:rgba(12,14,18,.78); border-bottom:1px solid var(--line)}
+  nav .wrap{display:flex; align-items:center; gap:18px; height:58px}
+  .brand{font-weight:700; letter-spacing:.2px}
+  .brand .dot{color:var(--accent)}
+  nav .spacer{flex:1}
+  nav a.navlink{color:var(--muted); font-size:14px}
+  nav a.navlink:hover{color:var(--ink); text-decoration:none}
+  .btn{display:inline-block; padding:9px 16px; border-radius:10px; font-weight:600; font-size:14px;
+       border:1px solid var(--line); color:var(--ink); background:var(--panel-2)}
+  .btn:hover{text-decoration:none; border-color:#333c49}
+  .btn.primary{background:linear-gradient(180deg,#2dd4bf,#14b8a6); color:#04201c; border:none}
+  .btn.primary:hover{filter:brightness(1.07)}
+
+  /* hero */
+  header.hero{padding:84px 0 56px; border-bottom:1px solid var(--line);
+    background:radial-gradient(900px 420px at 78% -8%,rgba(56,189,248,.10),transparent 60%),
+               radial-gradient(700px 360px at 8% 0%,rgba(94,234,212,.09),transparent 55%)}
+  .eyebrow{color:var(--accent); font-weight:600; font-size:13px; letter-spacing:.14em; text-transform:uppercase}
+  h1{font-size:clamp(32px,5vw,52px); line-height:1.08; margin:14px 0 0; letter-spacing:-.5px}
+  h1 .grad{background:linear-gradient(90deg,#5eead4,#38bdf8); -webkit-background-clip:text; background-clip:text; color:transparent}
+  .lede{max-width:720px; color:var(--muted); font-size:18px; margin:20px 0 0}
+  .cta-row{display:flex; flex-wrap:wrap; gap:12px; margin-top:30px}
+  .stats{display:flex; flex-wrap:wrap; gap:30px; margin-top:42px; color:var(--dim); font-size:14px}
+  .stats b{color:var(--ink); font-size:22px; display:block; font-weight:700}
+
+  /* install */
+  .install{margin-top:40px; background:var(--panel); border:1px solid var(--line);
+           border-radius:var(--radius); padding:18px 20px; max-width:760px}
+  .install .label{color:var(--dim); font-size:12px; text-transform:uppercase; letter-spacing:.12em; margin-bottom:8px}
+  pre{margin:0; overflow:auto; font-size:13.5px; line-height:1.7; color:#cdd6e3}
+  pre .c{color:var(--dim)}
+
+  /* sections */
+  section{padding:54px 0}
+  section.alt{background:linear-gradient(180deg,var(--bg),#0a0c10)}
+  .sec-head{margin-bottom:26px}
+  h2{font-size:13px; letter-spacing:.16em; text-transform:uppercase; color:var(--accent); margin:0 0 4px}
+  .sec-head .sub{color:var(--muted); font-size:15px}
+
+  .cat{margin:0 0 38px}
+  .cat h3{font-size:20px; margin:0 0 4px; letter-spacing:-.2px}
+  .cat .cdesc{color:var(--dim); font-size:14px; margin:0 0 16px}
+  .grid{display:grid; gap:14px; grid-template-columns:repeat(auto-fill,minmax(290px,1fr))}
+  .card{display:flex; flex-direction:column; background:var(--panel); border:1px solid var(--line);
+        border-radius:var(--radius); padding:16px 16px 14px; transition:border-color .15s,transform .15s}
+  .card:hover{border-color:#33414c; transform:translateY(-2px)}
+  .card .name{font-weight:700; font-size:15px}
+  .card .name code{color:var(--accent); font-size:14px}
+  .card p{margin:8px 0 12px; color:var(--muted); font-size:13.5px; flex:1}
+  .card .links{display:flex; gap:14px; font-size:13px}
+  .card .links a{color:var(--dim)}
+  .card .links a:hover{color:var(--accent-2)}
+
+  /* closing CTA */
+  .closing{background:linear-gradient(180deg,#0a0c10,#0c0e12); border-top:1px solid var(--line)}
+  .cta-box{background:linear-gradient(135deg,rgba(94,234,212,.10),rgba(56,189,248,.08));
+           border:1px solid var(--line); border-radius:20px; padding:46px 36px; text-align:center}
+  .cta-box h3{font-size:clamp(24px,3.4vw,34px); margin:0 0 12px; letter-spacing:-.4px}
+  .cta-box p{color:var(--muted); max-width:600px; margin:0 auto 26px; font-size:17px}
+
+  footer{border-top:1px solid var(--line); padding:34px 0; color:var(--dim); font-size:14px}
+  footer .wrap{display:flex; flex-wrap:wrap; gap:14px; align-items:center; justify-content:space-between}
+  footer a{color:var(--muted)}
+  @media (max-width:560px){ nav a.navlink{display:none} .stats{gap:20px} }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <span class="brand">agent<span class="dot">·</span>ops</span>
+    <span class="spacer"></span>
+    <a class="navlink" href="#tools">Tools</a>
+    <a class="navlink" href="https://deemwar.com/insights/coding-agents-need-an-operational-layer">Thesis</a>
+    <a class="navlink" href="https://github.com/deemwar-products/agent-ops">GitHub</a>
+    <a class="btn primary" href="https://deemwar.com/contact">Talk to us</a>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <div class="eyebrow">Built &amp; run by deemwar</div>
+    <h1>Your AI coding agent needs<br><span class="grad">an operational layer.</span></h1>
+    <p class="lede">
+      A coding agent edits your source, runs your shell, reads whatever files it can reach, and
+      spends money — at machine speed, often unattended. That's a production system. These are
+      <strong>33 small tools</strong> we built filling each operational gap, one real failure at a
+      time, running autonomous agent fleets on Claude Code in production.
+    </p>
+    <div class="cta-row">
+      <a class="btn primary" href="#tools">Browse the 33 tools</a>
+      <a class="btn" href="https://github.com/deemwar-products/agent-ops">View on GitHub →</a>
+      <a class="btn" href="https://deemwar.com/insights/coding-agents-need-an-operational-layer">Read the thesis</a>
+    </div>
+
+    <div class="stats">
+      <div><b>33</b>operational tools</div>
+      <div><b>0</b>dependencies — stock python3 / bash</div>
+      <div><b>1</b>script each — no install</div>
+      <div><b>heuristic</b>&amp; honestly labelled</div>
+    </div>
+
+    <div class="install">
+      <div class="label">Install — there is nothing to install</div>
+<pre><span class="c"># clone once, run any tool directly:</span>
+git clone https://github.com/deemwar-products/agent-ops
+python3 agent-ops/mcp-budget/mcp-budget .
+bash    agent-ops/preflight/preflight</pre>
+    </div>
+  </div>
+</header>
+
+<section id="tools">
+  <div class="wrap">
+    <div class="sec-head">
+      <h2>The tools</h2>
+      <div class="sub">Recover · prevent · observe · spend · secure · set up · verify. Each links to the write-up explaining the failure it prevents and the data behind it.</div>
+    </div>
+
+    <div class="cat">
+      <h3>Recover &amp; protect agent work</h3>
+      <p class="cdesc">Get vanished work back, and make it impossible to lose in the first place.</p>
+      <div class="grid">
+        <div class="card"><div class="name"><code>recover</code></div><p>Get an agent's vanished commit back — reflog + fsck recovery for work you thought was gone.</p><div class="links"><a href="recover/">code</a><a href="https://deemwar.com/insights/recover-an-agents-vanished-work">read the story →</a></div></div>
+        <div class="card"><div class="name"><code>unwedge</code></div><p>Rescue a Claude Code session stuck on the thinking-block 400 ("thinking blocks cannot be modified").</p><div class="links"><a href="unwedge/">code</a><a href="https://deemwar.com/insights/unwedge-a-stuck-claude-code-session">read the story →</a></div></div>
+        <div class="card"><div class="name"><code>auto-snapshot</code></div><p>Make an agent's uncommitted work impossible to lose — auto-snapshot the working tree.</p><div class="links"><a href="auto-snapshot/">code</a><a href="https://deemwar.com/insights/the-agent-work-you-cant-recover">read the story →</a></div></div>
+        <div class="card"><div class="name"><code>preflight</code></div><p>Ask git before your agents collide — a worktree/branch collision pre-check.</p><div class="links"><a href="preflight/">code</a><a href="https://deemwar.com/insights/preflight-check-before-agents-collide">read the story →</a></div></div>
+        <div class="card"><div class="name"><code>worktree-doctor</code></div><p>Flag agent worktrees that would silently lose work on cleanup.</p><div class="links"><a href="worktree-doctor/">code</a><a href="https://deemwar.com/insights/your-agent-fleets-worktrees-are-a-minefield">read the story →</a></div></div>
+        <div class="card"><div class="name"><code>mergerase</code></div><p>Find public capabilities that silently disappeared across a parallel-agent merge.</p><div class="links"><a href="mergerase/">code</a><a href="mergerase/blog-post.md">read the story →</a></div></div>
+      </div>
+    </div>
+
+    <div class="cat">
+      <h3>See your fleet (observe)</h3>
+      <p class="cdesc">Observe what a dozen unattended sessions are actually doing.</p>
+      <div class="grid">
+        <div class="card"><div class="name"><code>fleet-ps</code></div><p><code>ps</code> for your Claude Code agent fleet — which sessions are alive, on what branch, healthy or wedged.</p><div class="links"><a href="fleet-ps/">code</a><a href="https://deemwar.com/insights/a-dozen-agents-which-one-is-stuck">read the story →</a></div></div>
+        <div class="card"><div class="name"><code>session-stats</code></div><p>Read what a Claude Code session actually did, straight from the transcript.</p><div class="links"><a href="session-stats/">code</a><a href="https://deemwar.com/insights/whats-in-your-claude-code-session-file">read the story →</a></div></div>
+        <div class="card"><div class="name"><code>review-brief</code></div><p>A reviewer brief from the transcript — close the AI-code verification gap.</p><div class="links"><a href="review-brief/">code</a><a href="https://deemwar.com/insights/why-reviewing-ai-code-takes-longer">read the story →</a></div></div>
+      </div>
+    </div>
+
+    <div class="cat">
+      <h3>Prevent &amp; guard</h3>
+      <p class="cdesc">Stop the destructive command, the hidden instruction, the runaway fan-out.</p>
+      <div class="grid">
+        <div class="card"><div class="name"><code>agent-guard</code></div><p>A PreToolUse hook that blocks destructive agent commands (<code>git reset --hard</code>, <code>rm -rf</code>, <code>push --force</code>).</p><div class="links"><a href="agent-guard/">code</a><a href="https://deemwar.com/insights/stop-your-agent-running-git-reset-hard">read the story →</a></div></div>
+        <div class="card"><div class="name"><code>agent-frisk</code></div><p>Find the invisible Unicode instructions that hijack a coding agent.</p><div class="links"><a href="agent-frisk/">code</a><a href="https://deemwar.com/insights/your-agent-reads-text-you-cant-see">read the story →</a></div></div>
+        <div class="card"><div class="name"><code>forkcap</code></div><p>A fork-budget guard that caps Claude Code's runaway nested subagents.</p><div class="links"><a href="forkcap/">code</a><a href="forkcap/blog-post.md">read the story →</a></div></div>
+      </div>
+    </div>
+
+    <div class="cat">
+      <h3>Secure &amp; audit config</h3>
+      <p class="cdesc">Measure blast radius and catch the lethal combination across grants.</p>
+      <div class="grid">
+        <div class="card"><div class="name"><code>agent-reach</code></div><p>Measure a coding agent's secret blast radius — which secret stores are in reach.</p><div class="links"><a href="agent-reach/">code</a><a href="https://deemwar.com/insights/your-agent-can-read-everything-your-shell-can">read the story →</a></div></div>
+        <div class="card"><div class="name"><code>perm-audit</code></div><p>Flag over-permissive Claude Code <code>settings.json</code> permissions.</p><div class="links"><a href="perm-audit/">code</a><a href="https://deemwar.com/insights/the-loosest-line-in-your-claude-settings">read the story →</a></div></div>
+        <div class="card"><div class="name"><code>trifecta-scan</code></div><p>Cross-config lethal-trifecta scanner — catch read + untrusted + exfil reachable in one grant set.</p><div class="links"><a href="trifecta-scan/">code</a><a href="https://deemwar.com/insights/no-single-line-is-wrong-the-combination-is">read the story →</a></div></div>
+        <div class="card"><div class="name"><code>mcp-audit</code></div><p>Lint your <code>.mcp.json</code> — the highest-trust, never-linted agent config — for egress/security surface.</p><div class="links"><a href="mcp-audit/">code</a><a href="mcp-audit/blog-post.md">read the story →</a></div></div>
+      </div>
+    </div>
+
+    <div class="cat">
+      <h3>Context &amp; cost</h3>
+      <p class="cdesc">Find the tokens you spend before the first prompt — and the ones wasted after.</p>
+      <div class="grid">
+        <div class="card"><div class="name"><code>mcp-budget</code></div><p>Measure the context tax of your MCP servers — tokens spent before your first prompt.</p><div class="links"><a href="mcp-budget/">code</a><a href="https://deemwar.com/insights/the-hidden-context-tax-of-mcp">read the story →</a></div></div>
+        <div class="card"><div class="name"><code>agent-waste</code></div><p>Audit a session transcript for wasted tokens — re-reads, redundant tool results.</p><div class="links"><a href="agent-waste/">code</a><a href="https://deemwar.com/insights/the-tokens-your-agent-wastes-in-the-transcript">read the story →</a></div></div>
+        <div class="card"><div class="name"><code>context-carry</code></div><p>The cost of a read is its residence time — weight every result by tokens × turns re-sent.</p><div class="links"><a href="context-carry/">code</a><a href="https://deemwar.com/insights/the-cost-of-a-read-is-how-long-it-stays">read the story →</a></div></div>
+        <div class="card"><div class="name"><code>cachecost</code></div><p>Prompt-caching economics — what caching is actually saving you.</p><div class="links"><a href="cachecost/">code</a><a href="https://deemwar.com/insights/the-prompt-caching-10x-most-teams-miss">read the story →</a></div></div>
+        <div class="card"><div class="name"><code>context-lint</code></div><p>Audit your <code>CLAUDE.md</code> — it loads every session.</p><div class="links"><a href="context-lint/">code</a><a href="https://deemwar.com/insights/the-most-expensive-file-runs-every-turn">read the story →</a></div></div>
+      </div>
+    </div>
+
+    <div class="cat">
+      <h3>Config quality</h3>
+      <p class="cdesc">Generate, lint, and de-drift the instruction files your agent reads every run.</p>
+      <div class="grid">
+        <div class="card"><div class="name"><code>claude-md-gen</code></div><p>Generate a correct starter <code>CLAUDE.md</code> from your repo.</p><div class="links"><a href="claude-md-gen/">code</a><a href="https://deemwar.com/insights/your-repo-already-knows-how-to-build-itself">read the story →</a></div></div>
+        <div class="card"><div class="name"><code>skill-lint</code></div><p>Will your Claude Code skill ever get used? Lint its description.</p><div class="links"><a href="skill-lint/">code</a><a href="https://deemwar.com/insights/your-skills-description-is-the-whole-ballgame">read the story →</a></div></div>
+        <div class="card"><div class="name"><code>agentdrift</code></div><p>Detect drift across a repo's agent-instruction files (<code>CLAUDE.md</code> / <code>AGENTS.md</code> / <code>.cursorrules</code>).</p><div class="links"><a href="agentdrift/">code</a><a href="https://deemwar.com/insights/claude-md-and-agents-md-have-drifted">read the story →</a></div></div>
+        <div class="card"><div class="name"><code>tooldoc</code></div><p>MCP tool-description quality audit — find the undocumented parameters your agent guesses.</p><div class="links"><a href="tooldoc/">code</a><a href="https://deemwar.com/insights/your-agent-is-guessing-your-tool-parameters">read the story →</a></div></div>
+      </div>
+    </div>
+
+    <div class="cat">
+      <h3>Supply chain &amp; ecosystem measurement</h3>
+      <p class="cdesc">Run the measurement on your own repo before you trust the ecosystem's claims.</p>
+      <div class="grid">
+        <div class="card"><div class="name"><code>slopcheck</code></div><p>Audit dependencies for AI-hallucination / slopsquat risk.</p><div class="links"><a href="slopcheck/">code</a><a href="https://deemwar.com/insights/your-agent-imports-a-package-nobody-trusts">read the story →</a></div></div>
+        <div class="card"><div class="name"><code>mcpfunnel</code></div><p>Measure how much of the official MCP registry actually runs.</p><div class="links"><a href="mcpfunnel/">code</a><a href="https://deemwar.com/insights/in-the-registry-is-not-runs">read the story →</a></div></div>
+        <div class="card"><div class="name"><code>agentpr</code></div><p>Do AI PRs dodge review? Run the measurement on your own repo.</p><div class="links"><a href="agentpr/">code</a><a href="https://deemwar.com/insights/the-ai-skips-code-review-panic">read the story →</a></div></div>
+      </div>
+    </div>
+
+    <div class="cat">
+      <h3>Author agent demos</h3>
+      <p class="cdesc">Catch the render problems before you spend the render.</p>
+      <div class="grid">
+        <div class="card"><div class="name"><code>storyboard-doctor</code></div><p>Pre-render linter for auto-demo storyboard JSON — catch dead-air/duration mismatches before you render.</p><div class="links"><a href="storyboard-doctor/">code</a><a href="storyboard-doctor/README.md">read the story →</a></div></div>
+      </div>
+    </div>
+
+    <div class="cat">
+      <h3>Lint every channel (output gates)</h3>
+      <p class="cdesc">A human developer is gated everywhere — review reads the code, a teammate notices you're stuck, someone catches the key in the diff. An unattended agent has none of that. These are the cheap, loud, deterministic gates that put it back — one per channel the agent touches. Each exits non-zero on a problem, so it drops into a Stop hook or CI unchanged. <code>agent-frisk</code> guards the input channel; these four guard the output channels.</p>
+      <div class="grid">
+        <div class="card"><div class="name"><code>langcheck</code></div><p>Lint agent <strong>output prose</strong> for foreign-script intrusion, mojibake, and runaway repetition.</p><div class="links"><a href="langcheck/">code</a><a href="langcheck/README.md">read the story →</a></div></div>
+        <div class="card"><div class="name"><code>leaklint</code></div><p>Flag <strong>leaked secrets</strong> in agent output — redact-by-design, never reprints the value.</p><div class="links"><a href="leaklint/">code</a><a href="leaklint/README.md">read the story →</a></div></div>
+        <div class="card"><div class="name"><code>spinlint</code></div><p>Flag <strong>wasted-loop / stuck</strong> sessions burning tokens with no progress.</p><div class="links"><a href="spinlint/">code</a><a href="spinlint/README.md">read the story →</a></div></div>
+        <div class="card"><div class="name"><code>claimlint</code></div><p>Flag false <strong>completion claims</strong> ("tests pass", "created X") the transcript and filesystem contradict.</p><div class="links"><a href="claimlint/">code</a><a href="claimlint/README.md">read the story →</a></div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <div class="sec-head">
+      <h2>How it's built</h2>
+      <div class="sub">Honest by construction — so you can trust the number on the screen.</div>
+    </div>
+    <div class="grid">
+      <div class="card"><div class="name">One script, zero deps</div><p>Each tool is a single Python 3 or bash script. Stock interpreter only — nothing to <code>pip install</code>, nothing to vendor.</p></div>
+      <div class="card"><div class="name">33 tools, green in CI</div><p>Every tool ships a self-contained suite that builds its own fixtures. CI runs all of them on every push and PR — one green check per tool.</p></div>
+      <div class="card"><div class="name">Heuristic &amp; honestly labelled</div><p>Estimates, not bills. Where a finding is uncertain — or our own hypothesis lost — the write-up says so.</p></div>
+      <div class="card"><div class="name">From real failures</div><p>Each tool exists because something broke while running autonomous agent fleets in production. The write-up has the data behind it.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="closing">
+  <div class="wrap">
+    <div class="cta-box">
+      <h3>Putting agents to work on code that matters?</h3>
+      <p>We run autonomous coding-agent fleets in production and build the operational layer that keeps them safe, observable, and cheap. If that's your problem too — let's talk.</p>
+      <a class="btn primary" href="https://deemwar.com/contact">Talk to us →</a>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div>33 tools · built &amp; run by <a href="https://deemwar.com">deemwar</a></div>
+    <div>
+      <a href="https://github.com/deemwar-products/agent-ops">GitHub</a> ·
+      <a href="https://deemwar.com/insights/coding-agents-need-an-operational-layer">Thesis</a> ·
+      <a href="https://deemwar.com/contact">Contact</a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
