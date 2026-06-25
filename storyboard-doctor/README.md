@@ -20,4 +20,6 @@ Exit 0 = clean, 1 = problems. Built from a session where these exact issues forc
 
 Tests: `./test_storyboard_doctor.sh` (10/10).
 
+Built and run by [deemwar](https://deemwar.com). Putting agents to work on code that matters? **[Talk to us](https://deemwar.com/contact).**
+
 MIT © deemwar
