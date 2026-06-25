@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""spinlint — flag WASTED-LOOP / stuck agent sessions from a transcript.
+
+An unattended agent can spin: it reruns the same failing command, ping-pongs the same
+edit, or hits the same error over and over — burning turns and tokens with no progress.
+There are public reports of a single stuck session costing $500+ in tokens. agent-frisk
+guards INPUT, langcheck/leaklint guard OUTPUT prose/secrets; spinlint is the ACTION-layer
+sibling — it reads a session transcript and exits non-zero when the agent was spinning, so
+a fleet can gate wasted spend without piping every session into a trace SaaS.
+
+The load-bearing heuristic: identical action + repeated *error* outcome = stuck; a varying
+input OR an eventual success = productive. Outcome, not call count — a retry that finally
+succeeds is never flagged.
+
+Checks (crisp + deterministic — leads with the three reliable signals):
+  1. REPEAT-CALL  — the same tool call (name + identical input) made N+ times within a
+                    sliding window of recent calls. If every repeat also errored, that's the
+                    classic "retrying a failing command without changing it" loop.
+  2. REPEAT-ERROR — the same (normalized) tool error recurring N+ times (agent not learning).
+  3. PING-PONG    — one file edited with oscillating / low-diversity changes (churn).
+
+Usage:
+  spinlint --transcript session.jsonl
+  spinlint session.jsonl
+  cat session.jsonl | spinlint
+  spinlint session.jsonl --repeat 5 --repeat-error 4
+  spinlint --json --transcript s.jsonl    # machine-readable (for hooks)
+Exit 1 if any spin found, 0 if clean, 2 on usage/IO/parse error.
+"""
+import sys, os, re, json, argparse
+from collections import defaultdict
+
+EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit", "str_replace_editor"}
+
+def canon_input(inp):
+    """Canonical form of a tool_use input for equality — structure normalized (key order,
+    serialization whitespace), string *contents* left literal (don't collapse two different
+    commands that differ only in interior whitespace)."""
+    try:
+        return json.dumps(inp, sort_keys=True, separators=(",", ":"), ensure_ascii=False).strip()
+    except Exception:
+        return str(inp)
+
+def signature(name, inp):
+    """Short, non-dumping human signature for a tool call."""
+    if isinstance(inp, dict):
+        for k in ("command", "file_path", "path", "pattern", "query", "url"):
+            v = inp.get(k)
+            if isinstance(v, str) and v:
+                return v[:48]
+    return canon_input(inp)[:48]
+
+def norm_error(text):
+    """Normalize an error so 'the same error' matches despite volatile bits."""
+    if not isinstance(text, str):
+        text = str(text)
+    t = text.strip().split("\n")[0][:300]
+    t = re.sub(r"0x[0-9a-fA-F]+", "0xADDR", t)
+    t = re.sub(r"toolu_[A-Za-z0-9]+", "toolu_ID", t)
+    t = re.sub(r"/tmp/[^\s:]+|/var/folders/[^\s:]+", "/TMP", t)
+    t = re.sub(r"\b\d+\b", "N", t)
+    return re.sub(r"\s+", " ", t).strip().lower()
+
+def result_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+    return json.dumps(content, ensure_ascii=False) if content else ""
+
+def edit_fp(name, inp):
+    """Fingerprint the *change* an edit makes, to spot oscillation vs forward progress."""
+    if not isinstance(inp, dict):
+        return canon_input(inp)
+    if "old_string" in inp or "new_string" in inp:
+        return canon_input([inp.get("old_string", ""), inp.get("new_string", "")])
+    if "edits" in inp:
+        return canon_input(inp.get("edits"))
+    if "content" in inp:
+        return canon_input(inp.get("content"))
+    return canon_input(inp)
+
+def load_events(text):
+    """Ordered tool_use list (with call ordinals) + tool_result map keyed by tool_use_id."""
+    tool_uses = []
+    results = {}
+    ordn = 0
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if d.get("isMeta") or d.get("isSidechain"):
+            continue
+        msg = d.get("message") or d
+        role = msg.get("role") or d.get("type")
+        c = msg.get("content")
+        blocks = c if isinstance(c, list) else ([{"type": "text", "text": c}] if isinstance(c, str) else [])
+        if role == "assistant" or d.get("type") == "assistant":
+            for b in blocks:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    ordn += 1
+                    name = b.get("name", "tool")
+                    inp = b.get("input", {})
+                    f = (inp.get("file_path") or inp.get("path") or inp.get("notebook_path")) if isinstance(inp, dict) else None
+                    tool_uses.append({
+                        "name": name, "input": canon_input(inp), "sig": signature(name, inp),
+                        "file": f, "efp": edit_fp(name, inp) if name in EDIT_TOOLS else None,
+                        "id": b.get("id", ""), "ord": ordn,
+                    })
+        else:
+            for b in blocks:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    results[b.get("tool_use_id", "")] = {
+                        "is_error": bool(b.get("is_error")),
+                        "err": norm_error(result_text(b.get("content"))),
+                    }
+    return tool_uses, results
+
+def detect(tool_uses, results, repeat, repeat_error, pingpong, window):
+    findings = []
+    wasted_ords = set()   # dedupe wasted-call accounting across signals
+
+    # 1. REPEAT-CALL — a (name,input) key recurring >= N within a window of W calls
+    positions = defaultdict(list)
+    for tu in tool_uses:
+        positions[(tu["name"], tu["input"])].append(tu)
+    for (name, _inp), tus in positions.items():
+        ords = [t["ord"] for t in tus]
+        if len(ords) < repeat:
+            continue
+        clustered = False
+        l = 0
+        for r in range(len(ords)):
+            while ords[r] - ords[l] > window:
+                l += 1
+            if r - l + 1 >= repeat:
+                clustered = True
+                break
+        if not clustered:
+            continue
+        errs = sum(1 for t in tus if results.get(t["id"], {}).get("is_error"))
+        cnt = len(tus)
+        tail = " (all failing)" if errs == cnt else (" (%d/%d failed)" % (errs, cnt) if errs else "")
+        for t in tus[1:]:
+            wasted_ords.add(t["ord"])
+        findings.append({"detector": "REPEAT-CALL", "tool": name, "count": cnt,
+                         "first": ords[0], "last": ords[-1], "signature": tus[0]["sig"] + tail,
+                         "wasted": cnt - 1})
+
+    # 2. REPEAT-ERROR — same normalized error recurring (success would break the streak)
+    err_groups = defaultdict(list)
+    for tu in tool_uses:
+        r = results.get(tu["id"])
+        if r and r["is_error"] and r["err"]:
+            err_groups[r["err"]].append(tu["ord"])
+    for err, ords in err_groups.items():
+        if len(ords) >= repeat_error:
+            for o in ords[1:]:
+                wasted_ords.add(o)
+            findings.append({"detector": "REPEAT-ERROR", "tool": "", "count": len(ords),
+                             "first": ords[0], "last": ords[-1], "signature": err[:60],
+                             "wasted": len(ords) - 1})
+
+    # 3. PING-PONG — one file with oscillating / low-diversity edits
+    file_edits = defaultdict(list)
+    for tu in tool_uses:
+        if tu["name"] in EDIT_TOOLS and tu["file"]:
+            file_edits[tu["file"]].append(tu)
+    for f, tus in file_edits.items():
+        if len(tus) < pingpong:
+            continue
+        fps = [t["efp"] for t in tus]
+        distinct = len(set(fps))
+        oscillation = any(fps[k] in fps[:k-1] and fps[k] != fps[k-1] for k in range(2, len(fps)))
+        if oscillation or distinct <= 2:
+            ords = [t["ord"] for t in tus]
+            for o in ords[1:]:
+                wasted_ords.add(o)
+            reason = "oscillating" if oscillation else "%d distinct changes" % distinct
+            findings.append({"detector": "PING-PONG", "tool": tus[0]["name"], "count": len(tus),
+                             "first": ords[0], "last": ords[-1],
+                             "signature": "%s — %s" % (os.path.basename(f), reason),
+                             "wasted": len(tus) - distinct if not oscillation else len(tus) - 1})
+
+    findings.sort(key=lambda x: x["first"])
+    return findings, len(wasted_ords)
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("file", nargs="?")
+    ap.add_argument("--transcript")
+    ap.add_argument("--repeat", type=int, default=3, help="REPEAT-CALL threshold (default 3)")
+    ap.add_argument("--repeat-error", type=int, default=3, dest="repeat_error", help="REPEAT-ERROR threshold (default 3)")
+    ap.add_argument("--pingpong", type=int, default=4, help="PING-PONG edit threshold (default 4)")
+    ap.add_argument("--window", type=int, default=12, help="REPEAT-CALL lookback window in calls (default 12)")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    a = ap.parse_args()
+
+    path = a.transcript or a.file
+    if path:
+        if not os.path.exists(path):
+            print("spinlint: no such transcript: %s" % path, file=sys.stderr); return 2
+        text = open(path, encoding="utf-8", errors="replace").read(); src = path
+    else:
+        if sys.stdin.isatty():
+            print("usage: spinlint --transcript <jsonl> | <file> | (stdin)", file=sys.stderr); return 2
+        text = sys.stdin.read(); src = "<stdin>"
+
+    tool_uses, results = load_events(text)
+    if not tool_uses:
+        # distinguish a valid transcript that simply has no tool calls (→ clean, nothing to
+        # check) from a file that isn't a transcript at all (→ bad input).
+        records = 0
+        for ln in text.split("\n"):
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                d = json.loads(ln)
+            except Exception:
+                continue
+            if isinstance(d, dict) and (d.get("type") or d.get("message") or d.get("role")):
+                records += 1
+        if records == 0:
+            print("spinlint: no tool calls found — not a recognized agent transcript?", file=sys.stderr); return 2
+        if a.json:
+            print(json.dumps({"source": src, "total_tool_calls": 0, "clean": True, "estimated_wasted_calls": 0, "findings": []}, indent=2))
+        else:
+            print("spinlint — %s  (0 tool calls)" % src)
+            print("  ✓ clean — no wasted-loop patterns.")
+        return 0
+    findings, wasted = detect(tool_uses, results, a.repeat, a.repeat_error, a.pingpong, a.window)
+
+    if a.json:
+        print(json.dumps({
+            "source": src, "total_tool_calls": len(tool_uses),
+            "clean": not findings, "estimated_wasted_calls": wasted,
+            "findings": findings,
+        }, indent=2))
+        return 1 if findings else 0
+
+    print("spinlint — %s  (%d tool calls)" % (src, len(tool_uses)))
+    if not findings:
+        print("  ✓ clean — no wasted-loop patterns.")
+        return 0
+    print("  ✗ %d spin signal(s) — est. ~%d wasted tool-calls:" % (len(findings), wasted))
+    for fd in findings:
+        rng = "calls %s–%s" % (fd["first"], fd["last"]) if fd["last"] != fd["first"] else "call %s" % fd["first"]
+        tool = (fd["tool"] + " ") if fd["tool"] else ""
+        print("      [%s] %sx%d — %s, %s  (~%d wasted)"
+              % (fd["detector"], tool, fd["count"], fd["signature"], rng, fd["wasted"]))
+    return 1
+
+if __name__ == "__main__":
+    sys.exit(main())

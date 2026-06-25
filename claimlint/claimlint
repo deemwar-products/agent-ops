@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""claimlint — flag agent completion CLAIMS that the session and the filesystem contradict.
+
+The most-reported failure of unattended coding agents isn't a crash — it's a confident lie:
+"all tests pass", "created src/auth.py", "fixed in handleAuth()", "done" — when the tests
+never ran, the file was never written, or the cited symbol doesn't exist. agent-frisk guards
+INPUT, langcheck/leaklint guard OUTPUT prose/secrets, spinlint guards ACTIONS (was the session
+stuck) — claimlint guards OUTPUT TRUTHFULNESS: does the agent's victory claim match reality?
+
+It is ground-truth-honest by construction: it checks claims against the transcript's own
+tool-call records and (optionally) the filesystem — NEVER against the agent's own narration.
+That independence is the whole point; a checker that believed the agent would catch nothing.
+
+Checks:
+  1. TEST-CLAIM  — output asserts tests pass, but no test-runner tool call SUCCEEDED in the
+                   session (none ran, or every run errored).
+  2. FILE-CLAIM  — output says it created/edited a specific file, but there's no Edit/Write
+                   tool call for it AND (with --root) it isn't on disk.
+
+Usage:
+  claimlint --transcript session.jsonl
+  claimlint --transcript session.jsonl --root /path/to/repo   # also verify files on disk
+  claimlint session.jsonl
+  cat session.jsonl | claimlint
+  claimlint --json --transcript s.jsonl
+Exit 1 if any claim is unsupported, 0 if clean, 2 on usage/IO/parse error.
+"""
+import sys, os, re, json, argparse
+
+# ── claim extraction (assertive past/present only — never future/conditional/quoted) ──
+# A claim is suppressed if its sentence is future ("I'll create"), conditional ("if tests
+# pass"), or an instruction echo ("run the tests") — those aren't assertions of done work.
+FUTURE = re.compile(r"\b(i'?ll|i will|let me|let's|going to|gonna|i'?m going to|next|should|"
+                    r"need to|would|could|to make|try to|attempt|plan to|will now|about to)\b", re.I)
+CONDITIONAL = re.compile(r"\b(if|once|when|unless|until|assuming|provided|in case|so that|"
+                        r"to ensure|to verify|to confirm|make sure)\b", re.I)
+
+TEST_PASS = re.compile(
+    r"\b("
+    r"all\s+(the\s+)?tests?\s+(now\s+)?(pass|passed|passing|are\s+green|green)|"
+    r"tests?\s+(now\s+)?(pass|passed|passing|are\s+green|all\s+green)|"
+    r"(the\s+)?(test\s+)?suite\s+(passes|passed|is\s+green)|"
+    r"\d+\s+(tests?\s+)?(pass|passed|passing)|"
+    r"all\s+(pass|passing|green)\b"
+    r")", re.I)
+
+# "created/added/wrote/updated/edited <path>" where <path> looks like a real file
+PATHY = r"[`'\"]?([A-Za-z0-9_./\-]+/[A-Za-z0-9_./\-]+|[A-Za-z0-9_\-]+\.[A-Za-z0-9]{1,5})[`'\"]?"
+FILE_CLAIM = re.compile(
+    r"\b(created|added|wrote|generated|edited|updated|modified)\b"
+    r"(?:\s+(?:the|a|an|new|file|test|module|function|class))*\s+" + PATHY, re.I)
+
+# things that are clearly not real file paths even if they match PATHY
+NOT_A_FILE = re.compile(r"^(e\.g|i\.e|etc|vs|a\.k\.a|u\.s|\d+\.\d+)$", re.I)
+
+# test-runner commands (ground truth that tests actually ran)
+TEST_CMD = re.compile(
+    r"\b(pytest|py\.test|unittest|nosetests|tox|jest|vitest|mocha|npm\s+(run\s+)?test|"
+    r"yarn\s+test|pnpm\s+(run\s+)?test|go\s+test|cargo\s+test|mvn\s+(test|verify)|"
+    r"gradle\s+test|rspec|phpunit|dotnet\s+test|ctest|make\s+test|bun\s+test)\b", re.I)
+TEST_FAIL = re.compile(r"\b(\d+\s+failed|fail(ed|ure)|error|assert|traceback|exception|"
+                      r"not\s+ok|✗|✖)\b", re.I)
+TEST_OK = re.compile(r"\b(\d+\s+passed|all\s+pass|ok\b|passed|0\s+failed|✓|✔|success)\b", re.I)
+
+def sentences(text):
+    return [s.strip() for s in re.split(r"(?<=[.!?\n])\s+|\n", text) if s.strip()]
+
+def load(text):
+    """Return (assistant_texts_joined, final_text, tool_uses[list of {name,input,id}],
+    results{id->{is_error,text}})."""
+    asst_texts, final = [], ""
+    tool_uses, results = [], {}
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if d.get("isMeta") or d.get("isSidechain"):
+            continue
+        msg = d.get("message") or d
+        role = msg.get("role") or d.get("type")
+        c = msg.get("content")
+        blocks = c if isinstance(c, list) else ([{"type": "text", "text": c}] if isinstance(c, str) else [])
+        if role == "assistant" or d.get("type") == "assistant":
+            txt = []
+            for b in blocks:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "tool_use":
+                    tool_uses.append({"name": b.get("name", ""), "input": b.get("input", {}), "id": b.get("id", "")})
+                elif b.get("type") == "text" and isinstance(b.get("text"), str):
+                    txt.append(b["text"])
+            if txt:
+                joined = "\n".join(txt)
+                asst_texts.append(joined)
+                final = joined
+        else:
+            for b in blocks:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    content = b.get("content")
+                    t = content if isinstance(content, str) else (
+                        " ".join(x.get("text", "") for x in content if isinstance(x, dict)) if isinstance(content, list) else "")
+                    results[b.get("tool_use_id", "")] = {"is_error": bool(b.get("is_error")), "text": t}
+    return asst_texts, final, tool_uses, results
+
+def tests_succeeded(tool_uses, results):
+    """True iff some test-runner command ran and its result was not an error / looks passing."""
+    for tu in tool_uses:
+        cmd = tu["input"].get("command", "") if isinstance(tu["input"], dict) else ""
+        if tu["name"] == "Bash" and TEST_CMD.search(cmd):
+            r = results.get(tu["id"], {})
+            if not r.get("is_error"):
+                txt = r.get("text", "")
+                if TEST_OK.search(txt) and not re.search(r"\b[1-9]\d*\s+failed\b", txt):
+                    return True
+                if txt and not TEST_FAIL.search(txt):
+                    return True
+    return False
+
+def edited_files(tool_uses):
+    out = set()
+    for tu in tool_uses:
+        if tu["name"] in ("Edit", "Write", "MultiEdit", "NotebookEdit") and isinstance(tu["input"], dict):
+            f = tu["input"].get("file_path") or tu["input"].get("notebook_path") or tu["input"].get("path")
+            if f:
+                out.add(f)
+    return out
+
+def claim_text(texts, final, scan_all):
+    return "\n".join(texts) if scan_all else final
+
+def detect(texts, final, tool_uses, results, root, scan_all):
+    findings = []
+    text = claim_text(texts, final, scan_all)
+
+    # 1. TEST-CLAIM
+    for s in sentences(text):
+        if TEST_PASS.search(s) and not FUTURE.search(s) and not CONDITIONAL.search(s):
+            if not tests_succeeded(tool_uses, results):
+                findings.append(("TEST-CLAIM", "claims tests pass, but no test run succeeded in the session: %r" % s[:90]))
+            break  # one test-claim finding is enough
+
+    # 2. FILE-CLAIM
+    edited = edited_files(tool_uses)
+    edited_base = {os.path.basename(f) for f in edited}
+    seen = set()
+    for s in sentences(text):
+        if FUTURE.search(s) or CONDITIONAL.search(s):
+            continue
+        for m in FILE_CLAIM.finditer(s):
+            path = m.group(2).strip("`'\"").rstrip(".,;:)!?")
+            if NOT_A_FILE.match(path) or not path or path in seen:
+                continue
+            seen.add(path)
+            base = os.path.basename(path)
+            # supported if an edit tool touched it (by path or basename) ...
+            if path in edited or base in edited_base or any(e.endswith(path) or e.endswith("/" + base) for e in edited):
+                continue
+            # ... or, with --root, if it exists on disk
+            if root and (os.path.exists(os.path.join(root, path)) or os.path.exists(path)):
+                continue
+            where = "no edit tool call" + (" and not on disk" if root else "")
+            findings.append(("FILE-CLAIM", "claims '%s' created/edited, but %s" % (path, where)))
+    return findings
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("file", nargs="?")
+    ap.add_argument("--transcript")
+    ap.add_argument("--root", help="repo root — also verify claimed files exist on disk")
+    ap.add_argument("--all", action="store_true", help="scan all assistant messages, not just the final one")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+
+    path = a.transcript or a.file
+    if path:
+        if not os.path.exists(path):
+            print("claimlint: no such transcript: %s" % path, file=sys.stderr); return 2
+        text = open(path, encoding="utf-8", errors="replace").read(); src = path
+    else:
+        if sys.stdin.isatty():
+            print("usage: claimlint --transcript <jsonl> | <file> | (stdin)", file=sys.stderr); return 2
+        text = sys.stdin.read(); src = "<stdin>"
+
+    texts, final, tool_uses, results = load(text)
+    if not texts and not tool_uses:
+        print("claimlint: no assistant messages found — not a recognized agent transcript?", file=sys.stderr); return 2
+    # assistant turns exist but no prose → no completion claims to verify → clean
+    findings = detect(texts, final, tool_uses, results, a.root, a.all)
+
+    if a.json:
+        print(json.dumps({"source": src, "clean": not findings,
+                          "findings": [{"check": k, "detail": d} for k, d in findings]}, indent=2))
+        return 1 if findings else 0
+
+    print("claimlint — %s" % src)
+    if not findings:
+        print("  ✓ clean — completion claims are supported by the session.")
+        return 0
+    print("  ✗ %d unsupported claim(s):" % len(findings))
+    for kind, d in findings:
+        print("      [%s] %s" % (kind, d))
+    return 1
+
+if __name__ == "__main__":
+    sys.exit(main())

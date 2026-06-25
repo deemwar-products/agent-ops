@@ -88,6 +88,17 @@ bash    agent-ops/preflight/preflight
 |------|--------------|-----------|
 | [`storyboard-doctor`](storyboard-doctor/) | pre-render linter for auto-demo storyboard JSON — catch dead-air/duration mismatches before you render | [read →](storyboard-doctor/README.md) |
 
+### Lint every channel (output gates)
+
+A human developer is gated everywhere — review reads the code, a teammate notices you're stuck, someone catches the key in the diff. An unattended agent has none of that. These are the cheap, loud, deterministic gates that put it back — one per **channel** the agent touches. Each exits non-zero on a problem, so it drops into a Stop hook or CI unchanged. [`agent-frisk`](agent-frisk/) guards the **input** channel; these four guard the **output** channels.
+
+| Tool | What it does | The story |
+|------|--------------|-----------|
+| [`langcheck`](langcheck/) | lint agent **output prose** for foreign-script intrusion, mojibake, and runaway repetition | [read →](langcheck/README.md) |
+| [`leaklint`](leaklint/) | flag **leaked secrets** in agent output — redact-by-design, never reprints the value | [read →](leaklint/README.md) |
+| [`spinlint`](spinlint/) | flag **wasted-loop / stuck** sessions burning tokens with no progress | [read →](spinlint/README.md) |
+| [`claimlint`](claimlint/) | flag false **completion claims** ("tests pass", "created X") the transcript and filesystem contradict | [read →](claimlint/README.md) |
+
 ---
 
-29 tools. Everything here is heuristic and honestly labelled — estimates, not bills; where a finding is uncertain or our own hypothesis lost, the write-up says so. Built and run by [deemwar](https://deemwar.com). Putting agents to work on code that matters? **[Talk to us](https://deemwar.com/contact).**
+33 tools. Everything here is heuristic and honestly labelled — estimates, not bills; where a finding is uncertain or our own hypothesis lost, the write-up says so. Built and run by [deemwar](https://deemwar.com). Putting agents to work on code that matters? **[Talk to us](https://deemwar.com/contact).**

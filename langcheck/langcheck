@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""langcheck — flag contamination in LLM / agent OUTPUT text.
+
+A recurring, growing Claude-Code complaint: the model randomly drops foreign-script
+characters (e.g. CJK) into English output, emits mojibake, or degenerates into
+repeated lines. agent-frisk scans INPUT for hidden-unicode injection; langcheck is
+its mirror for OUTPUT quality. Scan a file / stdin / a session transcript; exit
+non-zero if contaminated (drops into a CI gate or a Stop hook).
+
+Checks:
+  1. SCRIPT-INTRUSION — runs of CJK/Hangul/Kana/Cyrillic/Arabic/etc. inside text
+     that is predominantly Latin (the "random Chinese characters" bug). A genuinely
+     non-Latin document is NOT flagged (it's reported as info and the check skips).
+  2. MOJIBAKE — U+FFFD replacement chars + common control-char garbage.
+  3. REPETITION — a non-trivial line repeated >= N times in a row (degeneration).
+
+Usage:
+  langcheck <file>
+  langcheck --transcript <session.jsonl>   # scans assistant-message text
+  cat out.txt | langcheck
+  langcheck --repeat 4        # repetition threshold (default 4)
+Exit 1 if any contamination found, 0 if clean.
+"""
+import sys, json, unicodedata, argparse, os
+
+# foreign-script unicode ranges (name, lo, hi) — letters, not punctuation/emoji
+SCRIPTS = [
+    ("CJK", 0x4E00, 0x9FFF), ("CJK-ExtA", 0x3400, 0x4DBF),
+    ("Hiragana", 0x3040, 0x309F), ("Katakana", 0x30A0, 0x30FF),
+    ("Hangul", 0xAC00, 0xD7AF), ("Cyrillic", 0x0400, 0x04FF),
+    ("Arabic", 0x0600, 0x06FF), ("Hebrew", 0x0590, 0x05FF),
+    ("Devanagari", 0x0900, 0x097F), ("Thai", 0x0E00, 0x0E7F),
+]
+def script_of(ch):
+    o = ord(ch)
+    for name, lo, hi in SCRIPTS:
+        if lo <= o <= hi:
+            return name
+    return None
+
+def is_latin_letter(ch):
+    return ch.isascii() and ch.isalpha()
+
+def scan_text(text, repeat_thresh):
+    findings = []
+    # --- dominance: is this predominantly-Latin text? ---
+    latin = sum(1 for c in text if is_latin_letter(c))
+    foreign = sum(1 for c in text if script_of(c))
+    letters = latin + foreign + sum(1 for c in text if c.isalpha() and not is_latin_letter(c) and not script_of(c))
+    predominantly_latin = letters > 0 and latin / max(letters, 1) >= 0.70
+
+    lines = text.split("\n")
+    # --- 1. script-intrusion (only if predominantly-Latin) ---
+    if predominantly_latin:
+        for i, line in enumerate(lines, 1):
+            run = ""; run_script = None; start = 0
+            def flush(col):
+                if run and len(run.strip()):
+                    findings.append(("SCRIPT-INTRUSION", i, "%s run %r" % (run_script, run[:40])))
+            for j, ch in enumerate(line):
+                s = script_of(ch)
+                if s:
+                    if not run: start = j
+                    run += ch; run_script = s
+                else:
+                    if run: flush(start); run = ""; run_script = None
+            if run: flush(start)
+    elif foreign > 0:
+        findings.append(("INFO", 0, "text is predominantly non-Latin (%d%% Latin letters) — script-intrusion check skipped" % (int(100*latin/max(letters,1)))))
+
+    # --- 2. mojibake / replacement / odd control chars ---
+    for i, line in enumerate(lines, 1):
+        if "�" in line:
+            findings.append(("MOJIBAKE", i, "U+FFFD replacement char"))
+        ctrl = [c for c in line if unicodedata.category(c).startswith("C") and c not in "\t"]
+        if ctrl:
+            findings.append(("CONTROL", i, "control char(s): " + " ".join("U+%04X" % ord(c) for c in ctrl[:5])))
+
+    # --- 3. runaway repetition (same non-blank line N+ times in a row) ---
+    run_line = None; run_n = 0; run_start = 0
+    for i, line in enumerate(lines, 1):
+        s = line.strip()
+        if s and s == run_line:
+            run_n += 1
+        else:
+            if run_n >= repeat_thresh:
+                findings.append(("REPETITION", run_start, "line repeated %dx: %r" % (run_n, (run_line or "")[:40])))
+            run_line = s; run_n = 1 if s else 0; run_start = i
+    if run_n >= repeat_thresh:
+        findings.append(("REPETITION", run_start, "line repeated %dx: %r" % (run_n, (run_line or "")[:40])))
+    return findings
+
+def text_from_transcript(path):
+    out = []
+    for line in open(path, encoding="utf-8", errors="replace"):
+        try: d = json.loads(line)
+        except: continue
+        msg = d.get("message") or d
+        if msg.get("role") == "assistant" or d.get("type") == "assistant":
+            c = msg.get("content")
+            if isinstance(c, str): out.append(c)
+            elif isinstance(c, list):
+                for b in c:
+                    if isinstance(b, dict) and b.get("type") == "text":
+                        out.append(b.get("text", ""))
+    return "\n".join(out)
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("file", nargs="?")
+    ap.add_argument("--transcript")
+    ap.add_argument("--repeat", type=int, default=4)
+    a = ap.parse_args()
+    if a.transcript:
+        if not os.path.exists(a.transcript):
+            print("langcheck: no such transcript: %s" % a.transcript, file=sys.stderr); return 2
+        text = text_from_transcript(a.transcript); src = a.transcript
+    elif a.file:
+        if not os.path.exists(a.file):
+            print("langcheck: no such file: %s" % a.file, file=sys.stderr); return 2
+        text = open(a.file, encoding="utf-8", errors="replace").read(); src = a.file
+    else:
+        if sys.stdin.isatty():
+            print("usage: langcheck <file> | --transcript <jsonl> | (stdin)", file=sys.stderr); return 2
+        text = sys.stdin.read(); src = "<stdin>"
+
+    findings = [f for f in scan_text(text, a.repeat)]
+    real = [f for f in findings if f[0] != "INFO"]
+    info = [f for f in findings if f[0] == "INFO"]
+    print("langcheck — %s" % src)
+    for kind, ln, msg in info:
+        print("  · %s" % msg)
+    if not real:
+        print("  ✓ clean — no output contamination.")
+        return 0
+    print("  ✗ %d issue(s):" % len(real))
+    for kind, ln, msg in real:
+        print("      [%s] line %s — %s" % (kind, ln, msg))
+    return 1
+
+if __name__ == "__main__":
+    sys.exit(main())

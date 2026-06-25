@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""leaklint — flag LEAKED SECRETS in LLM / agent OUTPUT, without ever printing the secret.
+
+An unattended agent writes to places humans used to gate — commits, docs, logs, chat
+replies, the shell. Sometimes it writes a live secret there: pastes back an API key it
+saw, echoes a token into a commit message, drops a private key into a file, bakes a
+credential into a `Bash` command. agent-frisk scans INPUT for hidden-unicode injection;
+langcheck lints OUTPUT for contamination; leaklint is the OUTPUT *safety* lint — it scans
+a file / stdin / a session transcript for secret-shaped strings and exits non-zero on a hit.
+
+THE LOAD-BEARING RULE: leaklint NEVER prints the matched secret value. A finding shows
+only the detector name, location, the value length, a non-reversible fingerprint
+(sha256[:8]), and at most the value's *public scheme prefix* (e.g. `ghp_`, `AKIA` — the
+vendor brand, not secret). That is what makes it safe to wire into the agent's own Stop
+hook — whose stdout flows back into the model's context. A scanner that echoed the secret
+to "show" you the finding would re-inject the very thing you're trying to contain.
+
+Checks (high-precision, prefix/format-anchored — not a noisy entropy zoo):
+  1. PROVIDER-KEY  — known vendor key formats (OpenAI/Anthropic, GitHub, AWS, Google,
+                     Slack, Stripe, GitLab, npm, JWT, ...).
+  2. PRIVATE-KEY   — PEM private-key headers (-----BEGIN ... PRIVATE KEY-----).
+  3. ASSIGNED-SECRET — NAME containing KEY/TOKEN/SECRET/PASSWORD = "<high-entropy literal>",
+                     only when the RHS is a real literal (not $VAR / os.environ / placeholder).
+
+Usage:
+  leaklint <file>
+  leaklint --transcript <session.jsonl>   # scans assistant text AND tool_use inputs
+  cat reply.txt | leaklint
+  leaklint --json out.txt                 # machine-readable (for hooks); still redacted
+Exit 1 if any secret found, 0 if clean, 2 on usage/IO error.
+"""
+import sys, os, re, json, math, hashlib, argparse
+from collections import Counter
+
+# --- redaction: turn a matched secret into a finding that leaks nothing -------------
+# The value exists transiently here only to compute len + sha256, then is dropped.
+# It is NEVER placed in a finding tuple, stdout, or --json. Do not "helpfully" add it.
+def fingerprint(secret):
+    return hashlib.sha256(secret.encode("utf-8", "replace")).hexdigest()[:8]
+
+def safe_label(secret, brand_prefix=""):
+    """Public brand prefix (safe) + length + non-reversible fingerprint. Never the value,
+    never a suffix. Short secrets (<=12) reveal ZERO leading chars."""
+    n = len(secret)
+    shown = brand_prefix if (brand_prefix and n > 12) else ""
+    head = ("%s… " % shown) if shown else ""
+    return "%slen=%d sha256:%s" % (head, n, fingerprint(secret))
+
+# --- provider key formats: (name, compiled regex, public-prefix length to disclose) -
+# The public-prefix is the scheme identifier (e.g. "ghp_") — NOT secret. We disclose at
+# most that prefix; the random tail is never shown. Append to this table for v2.
+PROVIDER = [
+    ("Anthropic key",        re.compile(r"sk-ant-[A-Za-z0-9_\-]{20,}"), 7),
+    ("OpenAI key",           re.compile(r"sk-(?:proj-)?[A-Za-z0-9_\-]{20,}"), 3),
+    ("GitHub token",         re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}"), 4),
+    ("GitHub fine-grained",  re.compile(r"\bgithub_pat_[A-Za-z0-9_]{60,}"), 11),
+    ("AWS access key id",    re.compile(r"\b(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA)[0-9A-Z]{16}\b"), 4),
+    ("Google API key",       re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b"), 4),
+    ("Google OAuth secret",  re.compile(r"\bGOCSPX-[0-9A-Za-z_\-]{20,}"), 7),
+    ("Slack token",          re.compile(r"\bxox[baprs]-[0-9A-Za-z\-]{10,}"), 5),
+    ("Stripe secret key",    re.compile(r"\b(?:sk|rk)_(?:live|test)_[0-9A-Za-z]{20,}"), 8),
+    ("GitLab PAT",           re.compile(r"\bglpat-[0-9A-Za-z_\-]{20,}"), 6),
+    ("npm token",            re.compile(r"\bnpm_[0-9A-Za-z]{36}\b"), 4),
+    # JWT: require BOTH header and payload to start `eyJ` (both decode to JSON `{"`),
+    # not just "three base64 chunks" — that anchor is what keeps it precise.
+    ("JWT",                  re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}"), 3),
+]
+
+PEM = re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP |ENCRYPTED )?PRIVATE KEY-----")
+
+# assigned-secret: a name that smells like a credential, set to a string literal
+ASSIGN = re.compile(
+    r"""(?P<name>[A-Za-z0-9_]*(?:API[_-]?KEY|ACCESS[_-]?KEY|SECRET|TOKEN|PASSWORD|PASSWD|PASSPHRASE|PRIVATE[_-]?KEY|CLIENT[_-]?SECRET)[A-Za-z0-9_]*)"""
+    r"""\s*[:=]\s*"""
+    r"""(?P<q>["'])(?P<val>[^"'\n]{16,})(?P=q)""",
+    re.IGNORECASE,
+)
+
+# obviously NOT a real secret (placeholders / templating). PLACEHOLDER is the full guard
+# for the fuzzy ASSIGNED-SECRET detector. PLACEHOLDER_STRONG is the *unambiguous* subset
+# safe to apply to anchored vendor matches — short English words (foo/bar/none) are NOT
+# here, because they can occur as substrings inside a genuinely random key tail and we must
+# not suppress a real leak. Template markers like xxxx/YOUR_/<…> can't occur in a real key.
+PLACEHOLDER_STRONG = re.compile(
+    r"(your[_-]?\w*|_?here\b|xxxx+|<[^>]*>|\{\{|\*{3,}|example|dummy|placeholder|"
+    r"redacted|sanitized|changeit|change[_-]?me|insert[_-]|replace[_-]|sample)",
+    re.IGNORECASE,
+)
+PLACEHOLDER = re.compile(
+    r"(your[_-]?\w*|_?here\b|xxxx+|<[^>]*>|\{\{|\}\}|\*{3,}|\.\.\.|…|example|dummy|"
+    r"placeholder|redacted|sanitized|changeit|change[_-]?me|insert[_-]|replace[_-]|"
+    r"sample|todo|fixme|fake|foo|bar|baz|none|null|test[_-]?(?:key|token|secret))",
+    re.IGNORECASE,
+)
+# value is a code reference to an env var rather than a literal secret
+ENV_REF = re.compile(
+    r"(os\.environ|getenv|process\.env|ENV\[|System\.getenv|Deno\.env|import\.meta\.env|"
+    r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|%[A-Z_]+%|\$\()",
+)
+# generic-only false positives that look high-entropy but aren't secrets
+UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+BARE_HEX = re.compile(r"^[0-9a-fA-F]{7,64}$")   # git SHAs, md5/sha hashes
+
+def shannon(s):
+    if not s:
+        return 0.0
+    n = len(s)
+    return -sum((c / n) * math.log2(c / n) for c in Counter(s).values())
+
+def looks_random(val):
+    """High-entropy enough to be a real secret, not an English word, path, uuid or hash."""
+    if PLACEHOLDER.search(val):
+        return False
+    if len(val) < 16 or " " in val.strip():
+        return False
+    if len(set(val)) < 5:                         # xxxxxxxx / 00000000 / aaaa...
+        return False
+    if UUID.match(val) or BARE_HEX.match(val):    # generic-only: drop uuids + bare hashes
+        return False
+    classes = sum(bool(re.search(p, val)) for p in (r"[a-z]", r"[A-Z]", r"[0-9]"))
+    return classes >= 2 and shannon(val) >= 3.5
+
+def scan_text(text, where=""):
+    """Return findings as (detector, line, col, msg, block) — value never in the tuple."""
+    findings = []
+    for i, line in enumerate(text.split("\n"), 1):
+        for name, rx, plen in PROVIDER:
+            for m in rx.finditer(line):
+                sec = m.group(0)
+                if PLACEHOLDER_STRONG.search(sec):    # e.g. sk-ant-xxxx… / ghp_YOUR_TOKEN
+                    continue
+                findings.append(("PROVIDER-KEY", i, m.start() + 1,
+                                 "%s — %s" % (name, safe_label(sec, sec[:plen])), where))
+        pm = PEM.search(line)
+        if pm:
+            findings.append(("PRIVATE-KEY", i, pm.start() + 1,
+                             "PEM private-key header — %s" % pm.group(0), where))
+        for m in ASSIGN.finditer(line):
+            val = m.group("val")
+            if ENV_REF.search(val):               # a reference, not a literal — the correct pattern
+                continue
+            if looks_random(val):
+                findings.append(("ASSIGNED-SECRET", i, m.start("val") + 1,
+                                 "%s = <literal> — %s" % (m.group("name"), safe_label(val)), where))
+    # de-dupe: same secret on the same line (e.g. matched by both PROVIDER and ASSIGN) once
+    seen, uniq = set(), []
+    for f in findings:
+        fp = f[3].split("sha256:")[-1] if "sha256:" in f[3] else f[3]
+        k = (f[1], f[2], fp)
+        if k in seen:
+            continue
+        seen.add(k); uniq.append(f)
+    return uniq
+
+def _stringify_tool_input(inp):
+    """Flatten a tool_use input dict to scannable text (a key in a Bash command counts)."""
+    try:
+        return json.dumps(inp, ensure_ascii=False)
+    except Exception:
+        return str(inp)
+
+def scan_transcript(path):
+    """Scan assistant text blocks AND tool_use inputs — opposite of langcheck, on purpose:
+    a leaked secret inside a Bash command / file Write is exactly the dangerous case."""
+    findings = []
+    for ln in open(path, encoding="utf-8", errors="replace"):
+        try:
+            d = json.loads(ln)
+        except Exception:
+            continue
+        msg = d.get("message") or d
+        if not (msg.get("role") == "assistant" or d.get("type") == "assistant"):
+            continue
+        c = msg.get("content")
+        blocks = c if isinstance(c, list) else ([{"type": "text", "text": c}] if isinstance(c, str) else [])
+        for b in blocks:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "text":
+                findings += scan_text(b.get("text", ""), where="text")
+            elif b.get("type") == "tool_use":
+                name = b.get("name", "tool")
+                findings += scan_text(_stringify_tool_input(b.get("input", {})), where="tool_use:%s" % name)
+    return findings
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("file", nargs="?")
+    ap.add_argument("--transcript")
+    ap.add_argument("--json", action="store_true", help="machine-readable output (still redacted)")
+    a = ap.parse_args()
+
+    if a.transcript:
+        if not os.path.exists(a.transcript):
+            print("leaklint: no such transcript: %s" % a.transcript, file=sys.stderr); return 2
+        findings = scan_transcript(a.transcript); src = a.transcript
+    elif a.file:
+        if not os.path.exists(a.file):
+            print("leaklint: no such file: %s" % a.file, file=sys.stderr); return 2
+        findings = scan_text(open(a.file, encoding="utf-8", errors="replace").read()); src = a.file
+    else:
+        if sys.stdin.isatty():
+            print("usage: leaklint <file> | --transcript <jsonl> | (stdin)", file=sys.stderr); return 2
+        findings = scan_text(sys.stdin.read()); src = "<stdin>"
+
+    if a.json:
+        # contract: NO "value" key ever exists in this object.
+        print(json.dumps({
+            "source": src,
+            "clean": not findings,
+            "findings": [
+                {"detector": k, "line": ln, "col": col, "redacted": msg, **({"block": blk} if blk else {})}
+                for k, ln, col, msg, blk in findings
+            ],
+        }, indent=2))
+        return 1 if findings else 0
+
+    print("leaklint — %s" % src)
+    if not findings:
+        print("  ✓ clean — no leaked secrets in output.")
+        return 0
+    print("  ✗ %d secret(s) found (values redacted):" % len(findings))
+    for kind, ln, col, msg, blk in findings:
+        loc = "line %s:%s" % (ln, col) + (" [%s]" % blk if blk else "")
+        print("      [%s] %s — %s" % (kind, loc, msg))
+    return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
