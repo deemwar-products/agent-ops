@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""skill-doctor — which of your Claude Code skills are SILENTLY broken?
+
+A skill registers only if the harness can find a real directory with a valid
+`SKILL.md` carrying a `name`. When that chain breaks — a symlinked skill whose
+target was deleted, a folder with no SKILL.md, a SKILL.md with no frontmatter or
+no `name` — the skill simply doesn't appear. No error, no warning: you think it's
+installed, the model never sees it. skill-doctor scans the skills *directory* for
+exactly these structural / registration faults across the whole tree.
+
+This is the STRUCTURAL-health complement to skill-lint, and stays in its lane:
+skill-lint judges one skill's DESCRIPTION QUALITY (vague / too short / SKILL.md
+size tax); skill-doctor never looks at description quality — only at whether the
+skill can register at all, plus name collisions and stray entries.
+
+Usage:
+  skill-doctor [SKILLS_DIR]        # default: ~/.claude/skills, then ./.claude/skills
+  skill-doctor --json              # machine-readable
+
+Exit 0 = clean, 1 = findings, 2 = bad input (dir missing / not a dir / empty).
+"""
+import argparse
+import json
+import os
+import re
+import sys
+
+RED = "\033[31m"; YEL = "\033[33m"; GRN = "\033[32m"; CYN = "\033[36m"; DIM = "\033[2m"; RST = "\033[0m"
+if not sys.stdout.isatty():
+    RED = YEL = GRN = CYN = DIM = RST = ""
+SEV_COLOR = {"HIGH": RED, "MED": YEL, "LOW": CYN}
+SEV_ORDER = {"HIGH": 0, "MED": 1, "LOW": 2}
+
+
+def parse_frontmatter(text):
+    """Return (meta dict, body) from a --- delimited YAML-ish header (no yaml dep).
+    Borrowed from skill-lint so both tools agree on what 'has frontmatter' means."""
+    if not text.startswith("---"):
+        return None, text
+    end = text.find("\n---", 3)
+    if end == -1:
+        return None, text
+    block = text[3:end].strip("\n").splitlines()
+    body = text[end + 4:]
+    meta, key = {}, None
+    for ln in block:
+        m = re.match(r"^([A-Za-z_][\w-]*):\s?(.*)$", ln)
+        if m:
+            key = m.group(1).lower()
+            meta[key] = m.group(2).strip()
+        elif key and ln.strip():            # continuation of a multiline value
+            meta[key] += " " + ln.strip()
+    for k, v in meta.items():
+        meta[k] = v.strip().strip('"').strip("'").strip()
+    return meta, body
+
+
+def default_skills_dir():
+    home = os.path.expanduser("~/.claude/skills")
+    if os.path.isdir(home):
+        return home
+    return os.path.join(os.getcwd(), ".claude", "skills")
+
+
+def scan(skills_dir):
+    """Return (findings, skills_scanned). A finding is a dict: name, code, severity, message.
+    Never raises on a malformed/unreadable/looping entry — those become findings."""
+    findings = []
+    add = lambda name, code, sev, msg: findings.append(
+        {"skill": name, "code": code, "severity": sev, "message": msg})
+
+    try:
+        entries = sorted(os.listdir(skills_dir))
+    except OSError as e:
+        # caller already validated isdir; this is a late permission failure
+        add(os.path.basename(skills_dir.rstrip("/")) or skills_dir, "UNREADABLE_DIR", "HIGH",
+            "cannot list the skills directory: %s" % e.strerror)
+        return findings, 0
+
+    names_seen = {}   # frontmatter name -> [entry, ...] for DUP_NAME
+    scanned = 0
+
+    for entry in entries:
+        if entry == ".DS_Store" or entry.startswith("."):
+            continue
+        full = os.path.join(skills_dir, entry)
+        is_link = os.path.islink(full)
+
+        # 1. BROKEN_SYMLINK — symlink whose target doesn't exist => skill vanishes.
+        if is_link:
+            try:
+                target = os.readlink(full)
+            except OSError:
+                target = "?"
+            if not os.path.exists(full):   # follows the link; False if dangling or loop
+                scanned += 1
+                add(entry, "BROKEN_SYMLINK", "HIGH",
+                    "symlink target does not exist (%s) — the skill silently disappears." % target)
+                continue
+
+        # determine if this entry is a skill candidate: a dir, or a symlink to a dir.
+        try:
+            is_dir = os.path.isdir(full)   # follows symlinks
+        except OSError:
+            is_dir = False
+
+        if not is_dir:
+            # 7. STRAY_ENTRY — a plain file sitting directly in the skills dir.
+            add(entry, "STRAY_ENTRY", "LOW",
+                "a non-directory entry in the skills dir — likely misplaced (skills must be directories).")
+            continue
+
+        # it's a skill (dir or symlink-to-dir)
+        scanned += 1
+        skill_md = os.path.join(full, "SKILL.md")
+
+        # 2. NO_SKILL_MD
+        try:
+            has_md = os.path.isfile(skill_md)
+        except OSError:
+            has_md = False
+        if not has_md:
+            add(entry, "NO_SKILL_MD", "HIGH",
+                "skill directory has no SKILL.md — it won't register.")
+            continue
+
+        # read SKILL.md robustly
+        try:
+            text = open(skill_md, encoding="utf-8", errors="replace").read()
+        except OSError as e:
+            add(entry, "UNREADABLE_SKILL_MD", "HIGH",
+                "SKILL.md cannot be read (%s) — treat as not registered." % (e.strerror or "I/O error"))
+            continue
+
+        meta, _ = parse_frontmatter(text)
+
+        # 3. NO_FRONTMATTER (registration only — NOT description quality)
+        if meta is None:
+            add(entry, "NO_FRONTMATTER", "HIGH",
+                "SKILL.md has no `--- ... ---` YAML frontmatter — it won't register.")
+            continue
+
+        name = meta.get("name", "").strip()
+
+        # 4. NO_NAME
+        if not name:
+            add(entry, "NO_NAME", "HIGH",
+                "frontmatter has no `name:` key — the skill won't register.")
+            continue
+
+        names_seen.setdefault(name, []).append(entry)
+
+        # 6. NAME_MISMATCH (LOW, heuristic) — declared name != directory name.
+        if name != entry:
+            add(entry, "NAME_MISMATCH", "LOW",
+                "frontmatter name `%s` differs from the directory `%s` (heuristic) — can confuse invocation." % (name, entry))
+
+    # 5. DUP_NAME (MED) — same frontmatter name declared by 2+ skills.
+    for name, owners in sorted(names_seen.items()):
+        if len(owners) > 1:
+            for owner in owners:
+                others = [o for o in owners if o != owner]
+                add(owner, "DUP_NAME", "MED",
+                    "name `%s` is also declared by: %s — collision, ambiguous which loads." % (name, ", ".join(others)))
+
+    return findings, scanned
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("skills_dir", nargs="?", help="path to a Claude Code skills directory")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    a = ap.parse_args()
+
+    skills_dir = a.skills_dir or default_skills_dir()
+
+    # bad input -> exit 2
+    if not os.path.exists(skills_dir):
+        msg = "skill-doctor: no such directory: %s" % skills_dir
+        print(json.dumps({"error": msg}) if a.json else msg, file=sys.stderr)
+        return 2
+    if not os.path.isdir(skills_dir):
+        msg = "skill-doctor: not a directory: %s" % skills_dir
+        print(json.dumps({"error": msg}) if a.json else msg, file=sys.stderr)
+        return 2
+    try:
+        visible = [e for e in os.listdir(skills_dir) if e != ".DS_Store" and not e.startswith(".")]
+    except OSError as e:
+        msg = "skill-doctor: cannot read %s: %s" % (skills_dir, e.strerror)
+        print(json.dumps({"error": msg}) if a.json else msg, file=sys.stderr)
+        return 2
+    if not visible:
+        msg = "skill-doctor: %s is empty — no skills to check." % skills_dir
+        print(json.dumps({"error": msg}) if a.json else msg, file=sys.stderr)
+        return 2
+
+    findings, scanned = scan(skills_dir)
+    high = sum(1 for f in findings if f["severity"] == "HIGH")
+    med = sum(1 for f in findings if f["severity"] == "MED")
+    low = sum(1 for f in findings if f["severity"] == "LOW")
+    summary = {"total": len(findings), "high": high, "med": med, "low": low}
+
+    if a.json:
+        print(json.dumps({
+            "skills_dir": skills_dir,
+            "skills_scanned": scanned,
+            "findings": findings,
+            "summary": summary,
+        }, indent=2))
+        return 1 if findings else 0
+
+    head = "skill-doctor — %s  %s(%d skill%s scanned)%s" % (
+        skills_dir, DIM, scanned, "" if scanned == 1 else "s", RST)
+    print(head + "\n")
+
+    if not findings:
+        print("  %s✓ all skills are structurally sound — every one can register.%s\n" % (GRN, RST))
+        print("  %schecks structural/registration health, not whether a skill is well-written "
+              "(see skill-lint) or works.%s" % (DIM, RST))
+        return 0
+
+    for f in sorted(findings, key=lambda x: (SEV_ORDER[x["severity"]], x["skill"], x["code"])):
+        sev = f["severity"]
+        print("  %s● %-4s%s %s%s%s  %s" % (
+            SEV_COLOR[sev], sev, RST, CYN, f["skill"], RST, f["code"]))
+        print("          %s%s%s" % (DIM, f["message"], RST))
+
+    print("\n  %s%d finding%s — HIGH %d · MED %d · LOW %d%s" % (
+        DIM, summary["total"], "" if summary["total"] == 1 else "s", high, med, low, RST))
+    print("  %schecks structural/registration health, not whether a skill is well-written "
+          "(see skill-lint) or works.%s" % (DIM, RST))
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
