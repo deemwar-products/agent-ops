@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""hooklint — lint your Claude Code `hooks` config before it fails silently.
+
+perm-audit checks what your agent may do; mcp-audit checks the servers it loads.
+hooklint checks the OTHER config that runs real shell on your machine: the
+`"hooks"` block in `.claude/settings.json`. Hooks fire commands on tool events
+(PreToolUse, Stop, …) — and the failure mode is quiet: a typo'd event name, a
+matcher on an event that ignores it, or an entry missing `"type":"command"`
+just never runs, with no error to tell you.
+
+  hooklint [settings.json]   # default search: ./.claude/settings.json,
+                             #   then ./.claude/settings.local.json, then ~/.claude/settings.json
+  hooklint -                 # read settings JSON from stdin
+  hooklint --json            # machine-readable findings
+
+Exit 0 = clean, 1 = problems found, 2 = bad input (missing file / invalid JSON
+/ no hooks block).
+
+This checks structure and known pitfalls — not whether a hook's logic is
+correct. A hook that runs and does the wrong thing looks clean here.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+
+RED = "\033[31m"; YEL = "\033[33m"; GRN = "\033[32m"; CYN = "\033[36m"; DIM = "\033[2m"; RST = "\033[0m"
+if not sys.stdout.isatty():
+    RED = YEL = GRN = CYN = DIM = RST = ""
+SEV = {"HIGH": RED, "MED": YEL, "LOW": CYN}
+SEV_ORDER = {"HIGH": 0, "MED": 1, "LOW": 2}
+
+# the exact valid event set in Claude Code
+VALID_EVENTS = (
+    "PreToolUse", "PostToolUse", "UserPromptSubmit", "Notification",
+    "Stop", "SubagentStop", "PreCompact", "SessionStart", "SessionEnd",
+)
+# only these two events consume `matcher`; on the rest it is ignored
+MATCHER_EVENTS = ("PreToolUse", "PostToolUse")
+
+DEFAULT_PATHS = (
+    os.path.join(".claude", "settings.json"),
+    os.path.join(".claude", "settings.local.json"),
+    os.path.expanduser(os.path.join("~", ".claude", "settings.json")),
+)
+
+# risky command heuristics (labelled as heuristic in the output)
+RISKY = (
+    (re.compile(r"\brm\s+-[a-z]*r[a-z]*f|\brm\s+-[a-z]*f[a-z]*r", re.I), "rm -rf"),
+    (re.compile(r"\b(curl|wget)\b[^\n|]*\|\s*(sudo\s+)?(ba)?sh\b", re.I), "curl|sh"),
+    (re.compile(r"\beval\b", re.I), "eval"),
+)
+
+
+def f(code, sev, event, msg, **extra):
+    d = {"code": code, "severity": sev, "event": event, "message": msg}
+    d.update(extra)
+    return d
+
+
+def check_command_entry(entry, event, findings):
+    """Validate a single hook entry: {type:command, command:...}."""
+    if not isinstance(entry, dict):
+        findings.append(f("HOOK_NOT_OBJECT", "HIGH", event,
+                          "a hook entry is not an object — it will not run."))
+        return
+    if entry.get("type") != "command" or not str(entry.get("command", "")).strip():
+        findings.append(f("HOOK_BAD_COMMAND", "HIGH", event,
+                          "hook entry is missing \"type\":\"command\" or has an empty/missing \"command\" — it never runs."))
+        return
+    cmd = str(entry["command"]).strip()
+
+    # 5. relative / bare-script command (heuristic)
+    first = cmd.split()[0] if cmd.split() else ""
+    bareword = first.startswith("./") or (
+        "/" not in first and re.search(r"\.(sh|py)$", first) is not None
+    )
+    if bareword:
+        findings.append(f("CMD_RELATIVE", "LOW", event,
+                          f"heuristic: command '{first}' looks relative — it may not resolve depending on the hook's working directory. Prefer an absolute path."))
+
+    # 6. risky command pattern (heuristic)
+    for pat, label in RISKY:
+        if pat.search(cmd):
+            findings.append(f("CMD_RISKY", "MED", event,
+                              f"heuristic: command contains a risky pattern ({label}) — review it; hooks run with your shell's privileges."))
+            break
+
+
+def lint(hooks):
+    """Lint the hooks block. Returns (findings, ok) where ok=False means no usable hooks block."""
+    findings = []
+
+    if not isinstance(hooks, dict):
+        findings.append(f("HOOKS_NOT_OBJECT", "HIGH", "(root)",
+                          "the \"hooks\" value is not an object — Claude Code expects event-name -> list-of-matcher-groups."))
+        return findings, True
+
+    for event, groups in hooks.items():
+        # 1. unknown / typo event name
+        if event not in VALID_EVENTS:
+            findings.append(f("UNKNOWN_EVENT", "HIGH", event,
+                              f"unknown event name '{event}' — not one of {', '.join(VALID_EVENTS)}. The hook is silently never fired."))
+            # still try to inspect its entries below; the event is just dead
+
+        if not isinstance(groups, list):
+            findings.append(f("EVENT_NOT_LIST", "HIGH", event,
+                              "event value is not a list of matcher-groups — it will not be applied."))
+            continue
+
+        # 7. empty hooks array for an event
+        if len(groups) == 0:
+            findings.append(f("EMPTY_EVENT", "LOW", event,
+                              "event has an empty matcher-group list — it does nothing."))
+            continue
+
+        for group in groups:
+            if not isinstance(group, dict):
+                findings.append(f("GROUP_NOT_OBJECT", "HIGH", event,
+                                  "a matcher-group is not an object — it will not be applied."))
+                continue
+
+            matcher = group.get("matcher")
+
+            # 3. matcher present on an event that ignores it
+            if matcher is not None and event in VALID_EVENTS and event not in MATCHER_EVENTS:
+                findings.append(f("MATCHER_IGNORED", "MED", event,
+                                  f"'{event}' does not use \"matcher\" (only {', '.join(MATCHER_EVENTS)} do) — the matcher does nothing here. Likely a mistake."))
+
+            # 4. invalid matcher regex (only meaningful where matcher is used)
+            if matcher is not None and event in MATCHER_EVENTS and isinstance(matcher, str):
+                try:
+                    re.compile(matcher)
+                except re.error as e:
+                    findings.append(f("BAD_MATCHER_REGEX", "HIGH", event,
+                                      f"matcher '{matcher}' is not a valid regex ({e}) — the matcher-group never matches."))
+
+            inner = group.get("hooks")
+            # 7. empty inner hooks list
+            if inner is None or (isinstance(inner, list) and len(inner) == 0):
+                findings.append(f("EMPTY_GROUP", "LOW", event,
+                                  "matcher-group has no \"hooks\" entries — it does nothing."))
+                continue
+            if not isinstance(inner, list):
+                findings.append(f("GROUP_HOOKS_NOT_LIST", "HIGH", event,
+                                  "matcher-group \"hooks\" is not a list — it will not run."))
+                continue
+
+            # 2/5/6: validate each command entry
+            for entry in inner:
+                check_command_entry(entry, event, findings)
+
+    return findings, True
+
+
+def discover(arg):
+    """Resolve the settings path. arg may be None (search defaults), '-' (stdin), or a path."""
+    if arg == "-":
+        return "-"
+    if arg:
+        return arg
+    for p in DEFAULT_PATHS:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def load(path):
+    """Return (doc, error). error is a string for exit-2 cases."""
+    if path == "-":
+        raw = sys.stdin.read()
+        src = "<stdin>"
+    else:
+        if not os.path.isfile(path):
+            return None, f"no such file: {path}"
+        try:
+            raw = open(path, encoding="utf-8", errors="replace").read()
+        except OSError as e:
+            return None, f"cannot read {path}: {e}"
+        src = path
+    try:
+        return json.loads(raw), None
+    except json.JSONDecodeError as e:
+        return None, f"invalid JSON in {src}: {e.msg} at line {e.lineno}"
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="hooklint",
+        description="Lint a Claude Code settings.json hooks config for common misconfigurations.",
+    )
+    ap.add_argument("path", nargs="?", default=None,
+                    help="settings.json to lint, or '-' for stdin "
+                         "(default: search ./.claude/settings.json, ./.claude/settings.local.json, ~/.claude/settings.json)")
+    ap.add_argument("--json", action="store_true", dest="as_json",
+                    help="emit machine-readable findings")
+    args = ap.parse_args()
+
+    path = discover(args.path)
+    if path is None:
+        msg = ("no settings.json found (looked in ./.claude/settings.json, "
+               "./.claude/settings.local.json, ~/.claude/settings.json)")
+        if args.as_json:
+            print(json.dumps({"findings": [], "summary": {"error": msg}}))
+        else:
+            sys.stderr.write(f"hooklint: {msg}\n")
+        sys.exit(2)
+
+    doc, err = load(path)
+    if err is not None:
+        if args.as_json:
+            print(json.dumps({"findings": [], "summary": {"error": err}}))
+        else:
+            sys.stderr.write(f"hooklint: {err}\n")
+        sys.exit(2)
+
+    hooks = doc.get("hooks") if isinstance(doc, dict) else None
+    if hooks is None:
+        msg = "no \"hooks\" block found — nothing to lint."
+        if args.as_json:
+            print(json.dumps({"findings": [], "summary": {"error": msg}}))
+        else:
+            sys.stderr.write(f"hooklint: {msg}\n")
+        sys.exit(2)
+
+    findings, _ = lint(hooks)
+    findings.sort(key=lambda d: SEV_ORDER[d["severity"]])
+
+    by_sev = {"HIGH": 0, "MED": 0, "LOW": 0}
+    for d in findings:
+        by_sev[d["severity"]] += 1
+    summary = {"total": len(findings), "high": by_sev["HIGH"],
+               "med": by_sev["MED"], "low": by_sev["LOW"]}
+
+    if args.as_json:
+        print(json.dumps({"findings": findings, "summary": summary}))
+        sys.exit(1 if findings else 0)
+
+    label = path if path != "-" else "<stdin>"
+    print(f"hooklint — {label}\n")
+    if not findings:
+        print(f"  {GRN}✓ no hook misconfigurations found.{RST}")
+        print(f"\n  {DIM}checks structure + known pitfalls, not whether a hook's logic is correct.{RST}")
+        sys.exit(0)
+    for d in findings:
+        sev = d["severity"]
+        print(f"  {SEV[sev]}● {sev:<4}{RST} [{d['code']}] {d['event']}")
+        print(f"          {DIM}{d['message']}{RST}")
+    print()
+    print(f"  {RED if by_sev['HIGH'] else YEL}{summary['total']} finding(s)"
+          + (f", {by_sev['HIGH']} high-severity" if by_sev["HIGH"] else "") + f".{RST}")
+    print(f"  {DIM}checks structure + known pitfalls, not whether a hook's logic is correct.{RST}")
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
