@@ -1,0 +1,66 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Discover every tool that ships a test suite, so the matrix is self-maintaining:
+  # add a tool + its test_<tool>.sh and CI picks it up with no workflow edit.
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      tools: ${{ steps.list.outputs.tools }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: list
+        run: |
+          tools=$(for d in */; do
+            d="${d%/}"
+            [ "$d" = "scripts" ] && continue
+            if compgen -G "$d/test_*.sh" >/dev/null || compgen -G "$d/test-*.sh" >/dev/null; then
+              printf '%s\n' "$d"
+            fi
+          done | sort | jq -R . | jq -cs .)
+          echo "tools=$tools" >> "$GITHUB_OUTPUT"
+          echo "Discovered tools: $tools"
+
+  # One job per tool — a green check per tool inside one shared workflow.
+  test:
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        tool: ${{ fromJson(needs.discover.outputs.tools) }}
+    name: test ${{ matrix.tool }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Configure git identity (a few suites build temp repos)
+        run: |
+          git config --global user.email "ci@agent-ops.local"
+          git config --global user.name "agent-ops ci"
+          git config --global init.defaultBranch main
+      - name: Test ${{ matrix.tool }}
+        run: bash scripts/run-tests.sh "${{ matrix.tool }}"
+
+  # Single required status: green only if every tool's job passed.
+  ci-ok:
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate on the matrix result
+        run: |
+          if [ "${{ needs.test.result }}" != "success" ]; then
+            echo "One or more tool suites failed."
+            exit 1
+          fi
+          echo "All tool suites passed ✅"
