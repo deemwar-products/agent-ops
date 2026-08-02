@@ -1,5 +1,7 @@
 # agent-ops
 
+[![Discord](https://img.shields.io/badge/AgentNexus-join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/V9C2kvHC8D)
+
 **Small, dependency-light operational tools for AI coding agents.**
 
 A coding agent edits your source, runs your shell, reads whatever files it can reach, and spends money — at machine speed, often unattended. That's a production system, and it needs the same operational layer you'd give anything else with that much reach: recover, prevent, observe, spend, secure, set up, verify.
