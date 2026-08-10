@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""mcp-doctor — will your MCP servers actually START? a static health check for .mcp.json.
+
+mcp-audit asks whether a server is SAFE; mcp-doctor asks whether it's RUNNABLE. They're
+complements — this tool runs NO security checks (no secret-shape / egress / pin scanning;
+that's mcp-audit's job). It catches the quietest failure in an agent setup: a server is
+configured, Claude Code reads it, tries to launch it, the command isn't installed (or the
+url is malformed), the spawn fails — and you just see *no tools* from that server, with no
+error in your face. mcp-doctor statically inspects each server entry and tells you which
+ones can't possibly start.
+
+HONEST SCOPE — this is a STATIC check. It verifies the `command` resolves on PATH (or is a
+real executable file) and that the config is well-formed. It NEVER starts a server, opens a
+socket, makes a network call, or checks auth/runtime. Some checks are heuristics, labelled
+as such below.
+
+Checks (each a finding with a stable code + severity):
+  • CMD_NOT_FOUND     HIGH         — stdio `command` doesn't resolve on PATH and isn't an
+                                     executable file → the server will fail to start.
+  • NO_COMMAND_OR_URL HIGH         — entry has neither a usable command nor a url/remote
+                                     type → malformed, nothing to launch.
+  • BAD_URL           HIGH         — remote server with a missing/malformed url
+                                     (no scheme, or scheme not http/https).
+  • ENV_UNSET         MED (heuristic) — env value / `${VAR}` reference points at a var that
+                                     is NOT set in the current process env → may fail to
+                                     authenticate. Reported by NAME only — never the value.
+  • LAZY_FETCH        LOW (heuristic) — command is npx/uvx/bunx: fetched on first run, so it
+                                     needs network + a correct package name to ever start.
+  • SHAPE issues      HIGH/MED     — mcpServers/entry/args/command of the wrong JSON type are
+                                     reported as findings, never crash.
+
+Input (path arg, default search, or `-` for stdin):
+  mcp-doctor [path]        # default: ./.mcp.json, then ~/.claude.json, then ~/.mcp.json
+  mcp-doctor -             # read config from stdin
+  mcp-doctor --json        # machine-readable
+
+Exit 0 = clean, 1 = findings, 2 = bad input (missing file / invalid JSON / no mcpServers).
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import sys
+
+RED = "\033[31m"; YEL = "\033[33m"; GRN = "\033[32m"; CYN = "\033[36m"; DIM = "\033[2m"; RST = "\033[0m"
+if not sys.stdout.isatty():
+    RED = YEL = GRN = CYN = DIM = RST = ""
+SEV = {"HIGH": RED, "MED": YEL, "LOW": CYN}
+
+# ${VAR} or $VAR references embedded in command / args / env strings
+VAR_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+LAZY = ("npx", "uvx", "bunx", "pnpx")
+
+
+def servers(doc):
+    """Return the (name -> config) map, or None if there's no mcpServers block.
+
+    Accepts: {"mcpServers": {...}}, {"servers": {...}}, and a bare top-level map that is
+    itself the servers map (every value an object) — the loose forms tools write in practice.
+    """
+    if not isinstance(doc, dict):
+        return None
+    for k in ("mcpServers", "servers"):
+        if k in doc:
+            return doc[k] if isinstance(doc[k], dict) else {"__shape__": doc[k]}
+    # bare top-level map of name -> server-config: accept only when every value LOOKS like
+    # a server entry (has a command/url/type/args/env key) — so a random config object
+    # isn't mistaken for "the servers map" (that case must report 'no mcpServers').
+    server_keys = ("command", "url", "type", "args", "env")
+    if doc and all(isinstance(v, dict) and any(k in v for k in server_keys) for v in doc.values()):
+        return doc
+    return None
+
+
+def var_refs(s):
+    out = []
+    for m in VAR_REF.finditer(s):
+        out.append(m.group(1) or m.group(2))
+    return out
+
+
+def command_resolves(cmd):
+    """True if `cmd` would launch: on PATH, or an existing executable file (abs / ./ / path)."""
+    if shutil.which(cmd):
+        return True
+    if (os.sep in cmd) or cmd.startswith("."):
+        return os.path.isfile(cmd) and os.access(cmd, os.X_OK)
+    return False
+
+
+def check_servers(srv):
+    """Return findings as a list of (name, code, sev, msg). Never raises on bad shapes."""
+    findings = []
+    add = lambda name, code, sev, msg: findings.append((name, code, sev, msg))
+
+    # the servers block itself was the wrong type (wrapped by servers())
+    if "__shape__" in srv and len(srv) == 1:
+        add("<config>", "SHAPE_MCPSERVERS", "HIGH",
+            "mcpServers is not an object (got %s) — nothing can be configured." % type(srv["__shape__"]).__name__)
+        return findings
+
+    for name, cfg in srv.items():
+        if not isinstance(cfg, dict):
+            add(name, "SHAPE_ENTRY", "HIGH",
+                "server entry is not an object (got %s) — malformed, can't launch." % type(cfg).__name__)
+            continue
+
+        url = cfg.get("url")
+        rtype = cfg.get("type")
+        is_remote = bool(url) or rtype in ("http", "sse", "streamable-http")
+        raw_cmd = cfg.get("command")
+
+        # ---- remote server: validate the url --------------------------------------
+        if is_remote:
+            if not isinstance(url, str) or not url.strip():
+                add(name, "BAD_URL", "HIGH",
+                    "remote server (type '%s') has no usable url — there's nothing to connect to." % (rtype or "?"))
+            else:
+                scheme = url.split("://", 1)[0].lower() if "://" in url else ""
+                if scheme not in ("http", "https"):
+                    add(name, "BAD_URL", "HIGH",
+                        "remote server url '%s' is malformed (need an http:// or https:// scheme)." % url)
+            # remote servers may still carry env/${VAR} refs (headers/auth) — check those too
+            _check_env_refs(name, cfg, add)
+            continue
+
+        # ---- stdio server: must have a runnable command ---------------------------
+        if raw_cmd is None:
+            add(name, "NO_COMMAND_OR_URL", "HIGH",
+                "server has neither a 'command' (stdio) nor a 'url'/remote 'type' — nothing to launch.")
+            _check_env_refs(name, cfg, add)
+            continue
+        if not isinstance(raw_cmd, str) or not raw_cmd.strip():
+            add(name, "SHAPE_COMMAND", "HIGH",
+                "'command' is not a non-empty string (got %s) — can't launch." % type(raw_cmd).__name__)
+            _check_env_refs(name, cfg, add)
+            continue
+
+        cmd = raw_cmd.strip()
+        args = cfg.get("args", [])
+        if "args" in cfg and not isinstance(args, list):
+            add(name, "SHAPE_ARGS", "MED",
+                "'args' is not a list (got %s) — Claude Code expects an array of strings." % type(args).__name__)
+            args = []
+
+        # CMD_NOT_FOUND — the headline check. Skip the resolve test for lazy fetchers,
+        # whose launcher (npx/uvx) is what must resolve, handled as LAZY_FETCH below.
+        base = os.path.basename(cmd)
+        if base in LAZY:
+            if not command_resolves(cmd):
+                add(name, "CMD_NOT_FOUND", "HIGH",
+                    "launcher '%s' is not on PATH and isn't an executable file — the server will fail to start." % cmd)
+            else:
+                pkg = next((a for a in args if isinstance(a, str) and not a.startswith("-")), "?")
+                add(name, "LAZY_FETCH", "LOW",
+                    "uses '%s' to fetch '%s' on first run — needs network + a correct package name to ever start (heuristic)." % (base, pkg))
+        elif not command_resolves(cmd):
+            add(name, "CMD_NOT_FOUND", "HIGH",
+                "command '%s' is not on PATH and isn't an executable file — the server will fail to start." % cmd)
+
+        _check_env_refs(name, cfg, add)
+
+    return findings
+
+
+def _check_env_refs(name, cfg, add):
+    """ENV_UNSET (MED, heuristic): collect every env var this entry depends on — explicit
+    `env` values and `${VAR}` refs in command/args/env — and flag any NOT set in os.environ.
+    Reports the var NAME only; the value is never read or printed."""
+    referenced = set()
+
+    env = cfg.get("env")
+    if isinstance(env, dict):
+        for k, v in env.items():
+            if isinstance(v, str):
+                refs = var_refs(v)
+                if refs:
+                    referenced.update(refs)
+                elif v == "":
+                    # empty env value: the var the key names is the thing that must be set
+                    referenced.add(k)
+            # a non-string / non-ref env value is a literal — not our concern (mcp-audit's)
+
+    for field in ("command", "url"):
+        val = cfg.get(field)
+        if isinstance(val, str):
+            referenced.update(var_refs(val))
+    args = cfg.get("args")
+    if isinstance(args, list):
+        for a in args:
+            if isinstance(a, str):
+                referenced.update(var_refs(a))
+
+    unset = sorted(v for v in referenced if v and v not in os.environ)
+    for v in unset:
+        add(name, "ENV_UNSET", "MED",
+            "references env var $%s which is NOT set in the current environment — the server may fail to authenticate (heuristic; value never read)." % v)
+
+
+def load(path):
+    """Return (doc, src_label) or print an error and exit(2) on bad input."""
+    if path == "-":
+        try:
+            return json.loads(sys.stdin.read()), "<stdin>"
+        except json.JSONDecodeError as e:
+            sys.stderr.write("mcp-doctor: invalid JSON on stdin (%s at line %d)\n" % (e.msg, e.lineno))
+            sys.exit(2)
+    if not os.path.isfile(path):
+        sys.stderr.write("mcp-doctor: no such file: %s\n" % path)
+        sys.exit(2)
+    try:
+        return json.loads(open(path, encoding="utf-8", errors="replace").read()), path
+    except json.JSONDecodeError as e:
+        sys.stderr.write("mcp-doctor: invalid JSON in %s (%s at line %d)\n" % (path, e.msg, e.lineno))
+        sys.exit(2)
+
+
+def discover(arg):
+    if arg:
+        return arg
+    for p in (".mcp.json",
+              os.path.expanduser("~/.claude.json"),
+              os.path.expanduser("~/.mcp.json")):
+        if os.path.isfile(p):
+            return p
+    return ".mcp.json"  # report the canonical name as missing
+
+
+DISCLAIMER = ("static check — verifies the command resolves and the config is well-formed; "
+              "it does NOT start the server or check network/auth/runtime.")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("path", nargs="?", help="path to .mcp.json (or '-' for stdin); "
+                    "default searches ./.mcp.json, ~/.claude.json, ~/.mcp.json")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    a = ap.parse_args()
+
+    src = a.path if a.path == "-" else discover(a.path)
+    doc, src_label = load(src)
+
+    srv = servers(doc)
+    if srv is None:
+        sys.stderr.write("mcp-doctor: no 'mcpServers' block in %s — nothing to check.\n" % src_label)
+        sys.exit(2)
+
+    findings = check_servers(srv)
+    n_servers = sum(1 for k in srv if k != "__shape__")
+
+    counts = {"HIGH": 0, "MED": 0, "LOW": 0}
+    for _, _, sev, _ in findings:
+        counts[sev] = counts.get(sev, 0) + 1
+
+    if a.json:
+        print(json.dumps({
+            "source": src_label,
+            "findings": [
+                {"server": name, "code": code, "severity": sev, "message": msg}
+                for name, code, sev, msg in findings
+            ],
+            "summary": {
+                "total": len(findings),
+                "high": counts["HIGH"],
+                "med": counts["MED"],
+                "low": counts["LOW"],
+            },
+            "disclaimer": DISCLAIMER,
+        }, indent=2))
+        sys.exit(1 if findings else 0)
+
+    print("mcp-doctor — %s  %s(%d server(s))%s\n" % (src_label, DIM, n_servers, RST))
+    if not findings:
+        print("  %s✓ all configured servers look runnable.%s" % (GRN, RST))
+        print("\n  %s%s%s" % (DIM, DISCLAIMER, RST))
+        sys.exit(0)
+
+    order = {"HIGH": 0, "MED": 1, "LOW": 2}
+    for name, code, sev, msg in sorted(findings, key=lambda f: (order[f[2]], f[0])):
+        print("  %s● %-4s%s %s  %s[%s]%s" % (SEV[sev], sev, RST, name, DIM, code, RST))
+        print("          %s%s%s" % (DIM, msg, RST))
+    print("\n  %s%d finding(s): %d high, %d med, %d low.%s" % (
+        YEL if counts["HIGH"] else DIM, len(findings),
+        counts["HIGH"], counts["MED"], counts["LOW"], RST))
+    print("\n  %s%s%s" % (DIM, DISCLAIMER, RST))
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
