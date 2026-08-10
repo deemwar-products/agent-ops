@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""ignorelint — catch secret-bearing files that git is ALREADY tracking, or that
+aren't gitignored: the classic "committed my .env / my .mcp.json with an API token".
+
+agent-reach measures the blast radius of secrets an agent could *read*; leaklint
+flags secrets in *output*; trifecta-scan looks at *granted capabilities*. ignorelint
+sits one layer over: the secret-bearing FILES sitting in your work tree, checked
+against git's IGNORE + TRACKING state. The disaster it catches is the one-keystroke
+one — a `.env` or `.mcp.json` that git is committing, where `.gitignore` won't save
+you because git is already tracking the file.
+
+It is AGENT-AWARE: it knows the files that hold agent/dev secrets (`.mcp.json`,
+`.claude/settings.local.json`, `.env`, private keys, `.npmrc`, …). It checks git
+STATE, not file CONTENTS — so it complements (does not duplicate) a content scanner.
+
+  ignorelint                  # scan the current git repo / subdir
+  ignorelint <path>           # scan a specific git repo / subdir
+  ignorelint --add '*.secret' # extend the secret-file list (repeatable)
+  ignorelint --json           # machine-readable
+
+Findings:
+  TRACKED_SECRET (HIGH)   — file is tracked/committed. .gitignore does NOT untrack it;
+                            the secret is in history. Rotate it, then `git rm --cached`.
+  UNIGNORED_SECRET (MED)  — present, not tracked, not ignored: one `git add .` from a
+                            leak. Add it to .gitignore.
+
+Exit 0 = clean, 1 = findings, 2 = bad input (not a git repo / git unavailable).
+SAFETY: ignorelint never reads a secret file's CONTENTS — it only inspects git state.
+"""
+import os
+import sys
+import json
+import fnmatch
+import argparse
+import subprocess
+
+RED = "\033[31m"; YEL = "\033[33m"; GRN = "\033[32m"; DIM = "\033[2m"; RST = "\033[0m"
+if not sys.stdout.isatty():
+    RED = YEL = GRN = DIM = RST = ""
+SEV = {"HIGH": RED, "MED": YEL, "LOW": GRN}
+
+# Curated, agent/dev-aware secret-file set. CONSERVATIVE on purpose — matched on the
+# file BASENAME unless the pattern contains a "/". No broad globs like *.key (too noisy).
+DEFAULT_PATTERNS = [
+    (".env", "env file (secrets/config)"),
+    (".env.*", "env file"),
+    (".mcp.json", "MCP server config (may hold tokens)"),
+    (".claude.json", "Claude config (may hold credentials)"),
+    ("settings.local.json", "Claude local settings (may hold secrets)"),  # under .claude/
+    ("secrets.json", "secrets file"),
+    ("*.pem", "PEM private key / cert"),
+    ("*.p12", "PKCS#12 key store"),
+    ("*.pfx", "PKCS#12 key store"),
+    ("id_rsa", "SSH private key"),
+    ("id_dsa", "SSH private key"),
+    ("id_ecdsa", "SSH private key"),
+    ("id_ed25519", "SSH private key"),
+    (".npmrc", "npm config (may hold an _authToken)"),
+    (".netrc", "netrc credentials"),
+    (".pypirc", "PyPI credentials"),
+]
+
+# NEVER flag these — committed-on-purpose example/template/public variants.
+SAFE_BASENAMES = {".env.example", ".env.sample", ".env.template", ".env.dist"}
+SAFE_SUFFIXES = (".example", ".sample", ".template", ".dist", ".pub")
+
+PRUNE = {".git", "node_modules"}
+
+
+def is_safe_variant(basename):
+    if basename in SAFE_BASENAMES:
+        return True
+    return basename.endswith(SAFE_SUFFIXES)
+
+
+def matches(basename, patterns):
+    """Return the human label if basename matches a secret pattern and is not a
+    safe (.example/.sample/.template/.dist/.pub) variant, else None."""
+    if is_safe_variant(basename):
+        return None
+    for pat, label in patterns:
+        if fnmatch.fnmatch(basename, pat):
+            return label
+    return None
+
+
+def git(root, *args):
+    """Run a git command in root; return the CompletedProcess (never reads file bodies)."""
+    return subprocess.run(["git", "-C", root, *args],
+                          capture_output=True, text=True)
+
+
+def is_work_tree(root):
+    r = git(root, "rev-parse", "--is-inside-work-tree")
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+def discover(root, patterns):
+    """Walk the work tree to find candidate secret files (by basename). Returns a sorted
+    list of repo-relative POSIX paths. Prunes .git and node_modules."""
+    hits = set()
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in PRUNE]
+        for fn in filenames:
+            if matches(fn, patterns):
+                rel = os.path.relpath(os.path.join(dirpath, fn), root)
+                hits.add(rel.replace(os.sep, "/"))
+    return sorted(hits)
+
+
+def is_tracked(root, relpath):
+    r = git(root, "ls-files", "--error-unmatch", "--", relpath)
+    return r.returncode == 0
+
+
+def is_ignored(root, relpath):
+    r = git(root, "check-ignore", "-q", "--", relpath)
+    return r.returncode == 0
+
+
+def scan(root, patterns):
+    """Return (candidate_count, findings). Each finding is a dict."""
+    candidates = discover(root, patterns)
+    findings = []
+    for rel in candidates:
+        label = matches(os.path.basename(rel), patterns)
+        tracked = is_tracked(root, rel)
+        ignored = is_ignored(root, rel)
+        if tracked:
+            # A file can be both ignored AND tracked — still HIGH; tracking wins.
+            findings.append({
+                "path": rel, "code": "TRACKED_SECRET", "severity": "HIGH",
+                "label": label,
+                "message": ("tracked by git (committed). .gitignore does NOT untrack a "
+                            "file git already tracks — the secret is in history. Rotate it, "
+                            "then: git rm --cached -- " + rel + "  (and add it to .gitignore)."),
+            })
+        elif not ignored:
+            findings.append({
+                "path": rel, "code": "UNIGNORED_SECRET", "severity": "MED",
+                "label": label,
+                "message": ("present, not tracked, and not gitignored — one `git add .` "
+                            "from a leak. Add it to .gitignore now: echo '" + rel + "' >> .gitignore"),
+            })
+        # present + ignored + not tracked => CLEAN (no finding)
+    return len(candidates), findings
+
+
+def summarize(findings):
+    sev = [f["severity"] for f in findings]
+    return {
+        "total": len(findings),
+        "high": sev.count("HIGH"),
+        "med": sev.count("MED"),
+        "low": sev.count("LOW"),
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("path", nargs="?", default=".",
+                    help="git repo / subdir to scan (default: current dir)")
+    ap.add_argument("--add", action="append", default=[], metavar="GLOB",
+                    help="extra secret-file glob (matched on basename); repeatable")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    args = ap.parse_args()
+
+    root = os.path.abspath(args.path)
+    if not os.path.isdir(root):
+        sys.stderr.write("ignorelint: not a directory: %s\n" % root)
+        sys.exit(2)
+
+    # git must be available and root must be inside a work tree.
+    try:
+        if not is_work_tree(root):
+            sys.stderr.write(
+                "ignorelint: not a git work tree: %s\n"
+                "  ignorelint inspects git's ignore/tracking state, so it needs a git repo. "
+                "Run it inside one (git init / git clone first).\n" % root)
+            sys.exit(2)
+    except FileNotFoundError:
+        sys.stderr.write("ignorelint: git not found on PATH — this tool requires git.\n")
+        sys.exit(2)
+
+    patterns = list(DEFAULT_PATTERNS) + [(g, "custom (--add)") for g in args.add]
+    scanned, findings = scan(root, patterns)
+    summary = summarize(findings)
+    order = {"HIGH": 0, "MED": 1, "LOW": 2}
+    findings.sort(key=lambda f: (order[f["severity"]], f["path"]))
+
+    if args.json:
+        print(json.dumps({
+            "repo": root,
+            "scanned": scanned,
+            "findings": findings,
+            "summary": summary,
+        }, indent=2))
+        sys.exit(1 if findings else 0)
+
+    print("ignorelint — %s%s%s\n" % (DIM, root, RST))
+    print("  %sscanned %d candidate secret file(s) against git's ignore/tracking state%s"
+          % (DIM, scanned, RST))
+    if not findings:
+        print("\n  %s✓ clean: no committed or un-gitignored secret files found.%s" % (GRN, RST))
+    else:
+        print()
+        for f in findings:
+            c = SEV[f["severity"]]
+            print("  %s●%s %s%-8s%s %s%s%s  %s— %s%s"
+                  % (c, RST, c, f["severity"], RST, f["path"],
+                     "", "", DIM, f["label"], RST))
+            print("           %s%s: %s%s" % (DIM, f["code"], f["message"], RST))
+        print()
+        n, h, m = summary["total"], summary["high"], summary["med"]
+        tail = []
+        if h:
+            tail.append("%d tracked (HIGH)" % h)
+        if m:
+            tail.append("%d un-gitignored (MED)" % m)
+        print("  %s%d finding(s)%s%s." % (
+            RED if h else YEL, n, RST,
+            (" — " + ", ".join(tail)) if tail else ""))
+
+    print("\n  %signorelint checks a curated list of commonly-secret FILENAMES against git's"
+          % DIM)
+    print("  ignore/tracking state — it does NOT scan file contents, so a custom-named or")
+    print("  inline secret won't be caught (use a content scanner like leaklint for that).%s" % RST)
+
+    sys.exit(1 if findings else 0)
+
+
+if __name__ == "__main__":
+    main()
