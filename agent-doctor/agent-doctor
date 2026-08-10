@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""agent-doctor — will your Claude Code custom subagent actually register and get routed to?
+
+A custom subagent is just a markdown file in `.claude/agents/<name>.md` (project) or
+`~/.claude/agents/<name>.md` (user): YAML frontmatter, then a body that is the agent's
+system prompt. The frontmatter is load-bearing in a way that fails SILENTLY — there's no
+error, the agent just isn't there:
+
+  • no `--- ... ---` frontmatter at all  → the file never registers as an agent.
+  • no `name`                            → nothing to reference it by.
+  • no `description`                     → the model routes to subagents by description;
+                                           with none, the agent is effectively unreachable
+                                           by auto-selection.
+
+agent-doctor is the AGENTS member of the "agent config that fails silently" family
+(hooklint = hooks, mcp-doctor = MCP servers, skill-doctor = skills, agent-doctor = agents).
+It scans an agents dir (or a single .md) and flags only the things it's confident break
+registration or routing — never your prompt's wording, never which tools you picked.
+
+  agent-doctor [DIR | agent.md]      # default: ~/.claude/agents, then ./.claude/agents
+  agent-doctor --json [...]
+
+Exit 0 = clean, 1 = findings, 2 = bad input (path missing / not a dir-or-.md / empty dir).
+"""
+import json
+import os
+import re
+import sys
+
+RED = "\033[31m"; YEL = "\033[33m"; GRN = "\033[32m"; CYN = "\033[36m"; DIM = "\033[2m"; RST = "\033[0m"
+if not sys.stdout.isatty():
+    RED = YEL = GRN = CYN = DIM = RST = ""
+SEV_COL = {"HIGH": RED, "MED": YEL, "LOW": CYN}
+
+
+def parse_frontmatter(text):
+    """Return (meta dict | None, body) from a --- delimited YAML-ish header (no yaml dep).
+
+    meta is None when there's no well-formed `--- ... ---` block. `tools` is preserved as
+    a list when written as a YAML block list, otherwise kept as the raw scalar string.
+    """
+    if not text.startswith("---"):
+        return None, text
+    end = text.find("\n---", 3)
+    if end == -1:
+        return None, text
+    block = text[3:end].strip("\n").splitlines()
+    body = text[end + 4:]
+    meta, key, list_acc = {}, None, None
+    for ln in block:
+        # YAML block-list item under the current key: "  - Read"
+        li = re.match(r"^\s*-\s+(.*)$", ln)
+        if li and key is not None:
+            if list_acc is None:
+                list_acc = []
+                meta[key] = list_acc
+            list_acc.append(li.group(1).strip().strip('"').strip("'"))
+            continue
+        m = re.match(r"^([A-Za-z_][\w-]*):\s?(.*)$", ln)
+        if m:
+            key = m.group(1).lower()
+            val = m.group(2).strip()
+            list_acc = None
+            meta[key] = val
+        elif key is not None and isinstance(meta.get(key), str) and ln.strip():
+            meta[key] += " " + ln.strip()   # continuation of a multiline scalar
+    for k, v in list(meta.items()):
+        if isinstance(v, str):
+            meta[k] = v.strip().strip('"').strip("'").strip()
+    return meta, body
+
+
+def audit_file(path):
+    """Return (agent_name_for_display, name_declared_or_None, findings[(code,sev,msg)])."""
+    findings = []
+    add = lambda code, sev, msg: findings.append((code, sev, msg))
+    base = os.path.basename(path)
+    stem = base[:-3] if base.endswith(".md") else base
+
+    try:
+        text = open(path, encoding="utf-8", errors="replace").read()
+    except OSError as e:
+        add("UNREADABLE", "HIGH", "could not read file: %s" % e)
+        return stem, None, findings
+
+    meta, body = parse_frontmatter(text)
+
+    if meta is None:
+        add("NO_FRONTMATTER", "HIGH",
+            "no `--- ... ---` YAML frontmatter — the file won't register as an agent.")
+        return stem, None, findings
+
+    name = meta.get("name")
+    name = name.strip() if isinstance(name, str) else name
+    desc = meta.get("description")
+    desc = desc.strip() if isinstance(desc, str) else desc
+
+    if not name:
+        add("NO_NAME", "HIGH", "frontmatter has no `name` — the agent can't be referenced.")
+    elif name != stem:
+        add("NAME_MISMATCH", "MED",
+            "frontmatter `name` (%s) differs from the filename (%s) — invocation confusion." % (name, stem))
+
+    if not desc:
+        add("NO_DESCRIPTION", "HIGH",
+            "frontmatter has no `description` — the model routes to subagents by description; "
+            "without one the agent is effectively unreachable by auto-selection.")
+
+    if "tools" in meta:
+        tv = meta["tools"]
+        # A valid `tools` is a comma-separated string of names or a YAML list. We keep YAML
+        # scalars as strings, so we judge a scalar by its TEXT: an inline mapping (`{...}`) or
+        # a bare number is neither a tool name nor a list and won't parse as tools. A normal
+        # comma-string ("Read, Bash") never looks like either, so this stays conservative.
+        if isinstance(tv, str):
+            sv = tv.strip()
+            if sv and (re.match(r"^\{.*\}$", sv) or re.match(r"^-?\d+(\.\d+)?$", sv)):
+                add("TOOLS_MALFORMED", "LOW",
+                    "`tools` is %r — not a comma-separated string of names or a list; may not parse." % sv)
+        elif not isinstance(tv, list):
+            add("TOOLS_MALFORMED", "LOW",
+                "`tools` is %s, not a comma-separated string or a list — may not parse." % type(tv).__name__)
+
+    if not body.strip():
+        add("EMPTY_BODY", "LOW",
+            "no system-prompt body after the frontmatter — the agent has no instructions.")
+
+    return (name or stem), name, findings
+
+
+def collect_files(target):
+    """Resolve the target to a (agents_dir, [md files], error) triple.
+
+    error is None on success, or one of: 'missing', 'not_md_or_dir', 'empty'.
+    """
+    if not os.path.exists(target):
+        return target, [], "missing"
+    if os.path.isfile(target):
+        if not target.endswith(".md"):
+            return os.path.dirname(target) or ".", [], "not_md_or_dir"
+        return os.path.dirname(target) or ".", [target], None
+    if os.path.isdir(target):
+        files = sorted(os.path.join(target, f) for f in os.listdir(target)
+                       if f.endswith(".md") and os.path.isfile(os.path.join(target, f)))
+        if not files:
+            return target, [], "empty"
+        return target, files, None
+    return target, [], "not_md_or_dir"
+
+
+def default_target():
+    home = os.path.join(os.path.expanduser("~"), ".claude", "agents")
+    if os.path.isdir(home):
+        return home
+    return os.path.join(".", ".claude", "agents")
+
+
+def run(target):
+    agents_dir, files, err = collect_files(target)
+    if err:
+        return agents_dir, [], None, err
+
+    all_findings = []          # list of (display_name, file, code, sev, msg)
+    names_seen = {}            # declared name -> [files]
+    for path in files:
+        disp, declared, findings = audit_file(path)
+        for code, sev, msg in findings:
+            all_findings.append((disp, path, code, sev, msg))
+        if declared:
+            names_seen.setdefault(declared, []).append(path)
+
+    # DUP_NAME: two+ agent files declare the same `name` — flag every file involved.
+    for nm, paths in names_seen.items():
+        if len(paths) > 1:
+            others = ", ".join(os.path.basename(p) for p in paths)
+            for p in paths:
+                all_findings.append((nm, p, "DUP_NAME", "MED",
+                    "name `%s` is also declared by another agent file (%s) — ambiguous which loads." % (nm, others)))
+
+    return agents_dir, files, all_findings, None
+
+
+def summarize(findings):
+    s = {"total": len(findings), "high": 0, "med": 0, "low": 0}
+    for _disp, _f, _code, sev, _msg in findings:
+        s[sev.lower()] = s.get(sev.lower(), 0) + 1
+    return s
+
+
+def main():
+    argv = sys.argv[1:]
+    as_json = "--json" in argv
+    positional = [a for a in argv if not a.startswith("-")]
+    target = positional[0] if positional else default_target()
+
+    agents_dir, files, findings, err = run(target)
+
+    if err:
+        msg = {
+            "missing": "no such path: %s" % target,
+            "not_md_or_dir": "not a directory or .md file: %s" % target,
+            "empty": "no agent .md files found in: %s" % target,
+        }[err]
+        if as_json:
+            print(json.dumps({"agents_dir": agents_dir, "agents_scanned": 0,
+                              "error": err, "message": msg,
+                              "findings": [], "summary": {"total": 0, "high": 0, "med": 0, "low": 0}},
+                             indent=2))
+        else:
+            sys.stderr.write("agent-doctor: %s\n" % msg)
+        sys.exit(2)
+
+    summary = summarize(findings)
+
+    if as_json:
+        print(json.dumps({
+            "agents_dir": agents_dir,
+            "agents_scanned": len(files),
+            "findings": [{"agent": disp, "file": path, "code": code,
+                          "severity": sev, "message": msg}
+                         for disp, path, code, sev, msg in findings],
+            "summary": summary,
+        }, indent=2))
+        sys.exit(1 if findings else 0)
+
+    print("agent-doctor — %s  %s(%d agent file%s)%s\n" % (
+        agents_dir, DIM, len(files), "" if len(files) == 1 else "s", RST))
+
+    if not findings:
+        print("  %s✓ every agent registers and is routable — nothing to fix.%s\n" % (GRN, RST))
+        print("  %sNote: checks structure/registration health, not whether the agent's prompt is\n"
+              "  well-written or its tool list is right.%s" % (DIM, RST))
+        sys.exit(0)
+
+    order = {"HIGH": 0, "MED": 1, "LOW": 2}
+    # group by file for readability
+    by_file = {}
+    for disp, path, code, sev, msg in findings:
+        by_file.setdefault((disp, path), []).append((code, sev, msg))
+    for (disp, path) in sorted(by_file):
+        print("  %s%s%s  %s%s%s" % (CYN, disp, RST, DIM, os.path.basename(path), RST))
+        for code, sev, msg in sorted(by_file[(disp, path)], key=lambda f: order[f[1]]):
+            print("    %s● %-4s%s %s%s%s" % (SEV_COL[sev], sev, RST, DIM, code, RST))
+            print("           %s" % msg)
+        print()
+
+    print("  %ssummary:%s %d finding(s) — %s%d HIGH%s · %s%d MED%s · %s%d LOW%s\n" % (
+        DIM, RST, summary["total"],
+        RED, summary["high"], RST, YEL, summary["med"], RST, CYN, summary["low"], RST))
+    print("  %sNote: checks structure/registration health, not whether the agent's prompt is\n"
+          "  well-written or its tool list is right.%s" % (DIM, RST))
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
